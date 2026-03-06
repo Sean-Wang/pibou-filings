@@ -398,9 +398,9 @@ class FormNPORTParser:
             }
             
             holdings = []
-            # Retrieve FILED_DATE and use REPORT_DATE as PERIOD_OF_REPORT for holdings
+            # Retrieve FILED_DATE and PERIOD_OF_REPORT from filing header for holdings
             filed_date_val = filing_info_df['FILED_DATE'].iloc[0] if not filing_info_df.empty and 'FILED_DATE' in filing_info_df.columns else None
-            period_of_report_val = filing_info_df['REPORT_DATE'].iloc[0] if not filing_info_df.empty and 'REPORT_DATE' in filing_info_df.columns else None
+            period_of_report_val = filing_info_df['PERIOD_OF_REPORT'].iloc[0] if not filing_info_df.empty and 'PERIOD_OF_REPORT' in filing_info_df.columns else None
             cik_val = filing_info_df['CIK'].iloc[0] if not filing_info_df.empty and 'CIK' in filing_info_df.columns else None
             
             # Parse each investment/security - ONLY security-specific data
@@ -410,7 +410,7 @@ class FormNPORTParser:
                     'HOLDING_ID': None,  # Will be auto-generated in database
                     'ACCESSION_NUMBER': accession_number,
                     'CIK': cik_val,
-                    'PERIOD_OF_REPORT': period_of_report_val, # Changed from REPORT_DATE
+                    'PERIOD_OF_REPORT': period_of_report_val,
                     'FILED_DATE': filed_date_val, # Added
                     'SEC_FILE_NUMBER': sec_file_number,
                     

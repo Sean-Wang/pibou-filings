@@ -283,6 +283,62 @@ def test_nport_parser_extracts_holdings_and_filing_info(tmp_path):
     assert holding_row["CIK"] == 1605941
 
 
+def test_nport_holdings_period_of_report_uses_header_date(tmp_path):
+    """PERIOD_OF_REPORT in holdings must come from the filing header, not the XML body."""
+    xml_block = """
+    <XML>
+    <edgarSubmission xmlns:nport="http://www.sec.gov/edgar/nport"
+                     xmlns:ncom="http://www.sec.gov/edgar/nportcommon"
+                     xmlns:com="http://www.sec.gov/edgar/common">
+      <nport:genInfo>
+        <nport:regName>Sample Fund</nport:regName>
+        <nport:regFileNumber>811-00001</nport:regFileNumber>
+        <nport:regLei>LEI123</nport:regLei>
+        <nport:seriesName>Sample Series</nport:seriesName>
+        <nport:seriesLei>SLEI123</nport:seriesLei>
+        <nport:repPdEnd>2025-09-30</nport:repPdEnd>
+        <nport:repPdDate>2025-09-30</nport:repPdDate>
+        <nport:isFinalFiling>N</nport:isFinalFiling>
+      </nport:genInfo>
+      <nport:fundInfo>
+        <nport:totAssets>1000</nport:totAssets>
+        <nport:totLiabs>100</nport:totLiabs>
+        <nport:netAssets>900</nport:netAssets>
+      </nport:fundInfo>
+      <nport:invstOrSec>
+        <nport:name>Test Security</nport:name>
+        <nport:cusip>222222222</nport:cusip>
+        <nport:balance>10</nport:balance>
+        <nport:valUSD>500</nport:valUSD>
+      </nport:invstOrSec>
+    </edgarSubmission>
+    </XML>
+    """
+    # Header says 20251231 but XML repPdEnd says 2025-09-30
+    content = textwrap.dedent(
+        f"""
+        SEC-HEADER
+        ACCESSION NUMBER: 0001605941-25-000002
+        CONFORMED SUBMISSION TYPE: NPORT-P
+        CENTRAL INDEX KEY: 0001605941
+        CONFORMED PERIOD OF REPORT: 20251231
+        SEC FILE NUMBER: 811-00001
+        FILED AS OF DATE: 20260115
+        PUBLIC DOCUMENT COUNT: 2
+        {xml_block}
+        """
+    ).strip()
+
+    parser = FormNPORTParser(output_dir=tmp_path)
+    parsed = parser.parse_filing(content)
+
+    assert not parsed["holdings"].empty
+    holding_row = parsed["holdings"].iloc[0]
+    period = pd.Timestamp(holding_row["PERIOD_OF_REPORT"])
+    # Should match the header date (2025-12-31), NOT the XML repPdEnd (2025-09-30)
+    assert period == pd.Timestamp("2025-12-31")
+
+
 def test_nport_save_parsed_data_drops_sensitive_columns(tmp_path):
     parser = FormNPORTParser(output_dir=tmp_path)
     parsed_data = {
