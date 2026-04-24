@@ -11,7 +11,6 @@ def _make_downloader(tmp_path):
     return SECDownloader(
         user_name="Test Runner",
         user_agent_email="test@example.com",
-        package_version="0.4.0",
         log_dir=tmp_path / "logs",
         max_workers=1,
         data_dir=tmp_path / "data_raw" / "test_raw",
@@ -38,7 +37,7 @@ def test_13f_parser_with_real_filing(tmp_path):
     raw_path = downloaded.iloc[0]["raw_path"]
     assert raw_path and raw_path.strip()
 
-    with open(raw_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(raw_path, encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
     parser = Form13FParser(output_dir=tmp_path / "parsed_13f")
@@ -71,7 +70,7 @@ def test_nport_parser_with_real_filing(tmp_path):
     raw_path = downloaded.iloc[0]["raw_path"]
     assert raw_path and raw_path.strip()
 
-    with open(raw_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(raw_path, encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
     parser = FormNPORTParser(output_dir=tmp_path / "parsed_nport")

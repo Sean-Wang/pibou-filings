@@ -1,3 +1,152 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[project]
+name = "piboufilings"
+dynamic = ["version"]
+description = "A Python library for downloading and parsing SEC EDGAR filings"
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.9"
+license = {file = "LICENCE"}
+authors = [
+    {name = "Pierre Bouquet", email = "pierrebouquet73000@gmail.com"},
+]
+keywords = ["sec", "edgar", "filings", "financial", "13f", "nport", "section 16", "parser"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "pandas>=2.0",
+    "requests>=2.28",
+    "tqdm>=4.64",
+    "urllib3>=1.26",
+    "lxml>=4.9",
+    "python-dateutil>=2.8.2",
+    "defusedxml>=0.7",
+]
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=0.9"]
+test = [
+    "pytest>=7",
+    "pytest-cov>=4",
+    "duckdb>=0.9",
+    "requests-mock>=1.11",
+    "freezegun>=1.2",
+]
+lint = [
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "pandas-stubs",
+    "types-requests",
+    "types-python-dateutil",
+]
+
+[project.urls]
+Homepage = "https://github.com/Pierre-Bouquet/pibou-filings"
+Source = "https://github.com/Pierre-Bouquet/pibou-filings"
+Issues = "https://github.com/Pierre-Bouquet/pibou-filings/issues"
+
+[tool.setuptools.dynamic]
+version = {attr = "piboufilings._version.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["piboufilings*"]
+exclude = ["tests*", "demo_local_*", "out*", "logs*"]
+
+[tool.setuptools.package-data]
+piboufilings = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "unit: fast offline unit tests",
+    "integration: tests that hit live SEC endpoints",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py39"
+extend-exclude = [
+    "demo_local_logs",
+    "demo_local_output",
+    "demo_local_raw",
+    "logs",
+    "out",
+    "data_parsed",
+    "data_raw",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+]
+ignore = [
+    "E501",    # line too long (handled by ruff format)
+    "B008",    # function calls in defaults (Path.cwd())
+    "SIM108",  # ternary vs if/else — readability preference
+    # PEP 585 / PEP 604 style: deferred until we standardize on
+    # `from __future__ import annotations` across the codebase.
+    "UP006",   # typing.List → list (requires 3.9 runtime OR future import)
+    "UP035",   # deprecated typing imports
+    "UP045",   # Optional[X] → X | None (requires 3.10 or future import)
+    "E402",    # module import not at top — we intentionally place module
+               # loggers before re-export imports in some modules
+    "W293",    # trailing whitespace on blank lines — cosmetic
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011", "E741"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+# We're not strict-typing everything yet; the goal here is to catch real bugs
+# (e.g. the exception-handler AttributeError we just fixed) without making the
+# CI signal noisy.
+disallow_untyped_defs = false
+no_implicit_optional = true
+exclude = [
+    "tests/",
+    "demo_local_",
+]
+
+[tool.coverage.run]
+source = ["piboufilings"]
+branch = true
+omit = [
+    "piboufilings/_version.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+skip_covered = false

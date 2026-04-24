@@ -4,17 +4,15 @@ import importlib
 import textwrap
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
-import pytest
 
 from piboufilings import get_parser_for_form_type_internal
+from piboufilings.config import settings
 from piboufilings.core.downloader import SECDownloader
 from piboufilings.parsers.form_13f_parser import Form13FParser
 from piboufilings.parsers.form_nport_parser import FormNPORTParser
 from piboufilings.parsers.form_sec16_parser import FormSection16Parser
 from piboufilings.parsers.parser_utils import validate_filing_content
-from piboufilings.config import settings
 
 
 def _sample_13f_content() -> str:
@@ -215,7 +213,7 @@ def test_13f_save_parsed_data_deduplicates_and_renames(tmp_path):
     parser = Form13FParser(output_dir=tmp_path)
     parsed_data = {
         "filing_info": pd.DataFrame(
-            [{"FORM_13F_FILE_NUMBER": "028-12345", "IRS_NUMBER": "12-3456789"}]
+            [{"FORM_13F_FILE_NUMBER": "028-12345", "IRS_NUMBER": "12-3456789", "CONFORMED_DATE": "20231231"}]
         ),
         "holdings": pd.DataFrame(
             [
@@ -224,6 +222,7 @@ def test_13f_save_parsed_data_deduplicates_and_renames(tmp_path):
                     "NAME_OF_ISSUER": "ACME",
                     "CUSIP": 0,
                     "SHARE_VALUE": 100,
+                    "CONFORMED_DATE": "20231231",
                 }
             ]
         ),
@@ -234,8 +233,8 @@ def test_13f_save_parsed_data_deduplicates_and_renames(tmp_path):
     parser.save_parsed_data(parsed_data, "028-12345", "0001234567")
     parser.save_parsed_data(parsed_data, "028-12345", "0001234567")  # second call should dedupe
 
-    info_path = tmp_path / "13f_info.csv"
-    holdings_path = tmp_path / "13f_holdings.csv"
+    info_path = tmp_path / "13f_info_2023_Q4.csv"
+    holdings_path = tmp_path / "13f_holdings_2023_Q4.csv"
     assert info_path.exists()
     assert holdings_path.exists()
 
@@ -248,6 +247,55 @@ def test_13f_save_parsed_data_deduplicates_and_renames(tmp_path):
     # Holdings should dedupe and keep SEC_FILE_NUMBER
     assert "SEC_FILE_NUMBER" in holdings_df.columns
     assert len(holdings_df) == 1
+
+
+def test_13f_save_parsed_data_avoids_concat_futurewarning_with_all_na_columns(tmp_path):
+    parser = Form13FParser(output_dir=tmp_path)
+    info_path = tmp_path / "13f_info_2023_Q4.csv"
+
+    # Seed file with a row where EXTRA_COL is all-NA for existing data.
+    existing = pd.DataFrame(
+        [
+            {
+                "SEC_FILE_NUMBER": "028-12345",
+                "IRS_NUMBER": "12-3456789",
+                "CONFORMED_DATE": "20231231",
+                "EXTRA_COL": pd.NA,
+            }
+        ]
+    )
+    existing.to_csv(info_path, index=False)
+
+    parsed_data = {
+        "filing_info": pd.DataFrame(
+            [
+                {
+                    "FORM_13F_FILE_NUMBER": "028-12346",
+                    "IRS_NUMBER": "98-7654321",
+                    "CONFORMED_DATE": "20231231",
+                    "EXTRA_COL": pd.NA,
+                }
+            ]
+        ),
+        "holdings": pd.DataFrame(),
+        "other_managers_reporting": pd.DataFrame(),
+        "other_included_managers": pd.DataFrame(),
+    }
+
+    # Regression guard: this code path previously triggered a pandas FutureWarning
+    # around concatenation with empty/all-NA entries.
+    import warnings
+
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        parser.save_parsed_data(parsed_data, "028-12346", "0001234567")
+
+    future_warnings = [warning for warning in record if issubclass(warning.category, FutureWarning)]
+    assert not future_warnings
+
+    saved = pd.read_csv(info_path)
+    assert len(saved) == 2
+    assert "EXTRA_COL" in saved.columns
 
 
 def test_nport_parser_skips_exhibits():
@@ -376,7 +424,7 @@ def test_nport_save_parsed_data_drops_sensitive_columns(tmp_path):
 
     parser.save_parsed_data(parsed_data)
 
-    holdings_path = tmp_path / "nport_holdings.csv"
+    holdings_path = tmp_path / "nport_holdings_2024_03.csv"
     assert holdings_path.exists()
     df = pd.read_csv(holdings_path)
     assert "CUSIP" in df.columns
@@ -413,7 +461,7 @@ def test_nport_dedup_on_filing_info(tmp_path):
     }
     parser.save_parsed_data(parsed_data)
     parser.save_parsed_data(parsed_data)
-    info_path = tmp_path / "nport_filing_info.csv"
+    info_path = tmp_path / "nport_filing_info_2024_03.csv"
     df = pd.read_csv(info_path)
     assert len(df) == 1
     assert "ACCESSION_NUMBER" in df.columns
@@ -445,7 +493,7 @@ def test_nport_dedup_prefers_row_with_cusip(tmp_path):
             "holdings": pd.DataFrame([better_row_with_cusip]),
         }
     )
-    holdings_path = tmp_path / "nport_holdings.csv"
+    holdings_path = tmp_path / "nport_holdings_2024_03.csv"
     df = pd.read_csv(holdings_path)
     assert len(df) == 1
     # Cast to string to be robust to pandas dtype inference (int vs. object)
@@ -504,9 +552,138 @@ def test_downloader_save_raw_filing_skips_exhibits(tmp_path):
         content="exhibit content",
         form_13f_file_number_for_path=None,
     )
-    assert np.isnan(result)
+    assert result is None
     # No raw files should be written for exhibits
     assert not any((tmp_path / "data").rglob("*.txt"))
+
+
+def test_downloader_partitions_13f_by_quarter(tmp_path):
+    downloader = SECDownloader(
+        user_name="Test",
+        user_agent_email="test@example.com",
+        data_dir=tmp_path / "data" / "raw_test",
+    )
+    filings = pd.DataFrame(
+        [
+            {"Date Filed": "20240115", "Filename": "edgar/data/1/0001-01-000001.txt"},
+            {"Date Filed": "20240320", "Filename": "edgar/data/1/0001-01-000002.txt"},
+            {"Date Filed": "20240402", "Filename": "edgar/data/1/0001-01-000003.txt"},
+        ]
+    )
+
+    buckets = downloader._partition_filings_by_period(filings, "13F-HR", "0000000001")
+
+    assert [bucket_key for bucket_key, _ in buckets] == ["2024-Q1", "2024-Q2"]
+    assert len(buckets[0][1]) == 2
+    assert len(buckets[1][1]) == 1
+
+
+def test_downloader_partitions_nport_by_month(tmp_path):
+    downloader = SECDownloader(
+        user_name="Test",
+        user_agent_email="test@example.com",
+        data_dir=tmp_path / "data" / "raw_test",
+    )
+    filings = pd.DataFrame(
+        [
+            {"Date Filed": "20240115", "Filename": "edgar/data/1/0001-01-000001.txt"},
+            {"Date Filed": "20240120", "Filename": "edgar/data/1/0001-01-000002.txt"},
+            {"Date Filed": "20240205", "Filename": "edgar/data/1/0001-01-000003.txt"},
+        ]
+    )
+
+    buckets = downloader._partition_filings_by_period(filings, "NPORT-P", "0000000001")
+
+    assert [bucket_key for bucket_key, _ in buckets] == ["2024-01", "2024-02"]
+    assert len(buckets[0][1]) == 2
+    assert len(buckets[1][1]) == 1
+
+
+def test_downloader_partitions_section16_by_month(tmp_path):
+    downloader = SECDownloader(
+        user_name="Test",
+        user_agent_email="test@example.com",
+        data_dir=tmp_path / "data" / "raw_test",
+    )
+    filings = pd.DataFrame(
+        [
+            {"Date Filed": "20240115", "Filename": "edgar/data/1/0001-01-000001.txt"},
+            {"Date Filed": "20240120", "Filename": "edgar/data/1/0001-01-000002.txt"},
+            {"Date Filed": "20240205", "Filename": "edgar/data/1/0001-01-000003.txt"},
+        ]
+    )
+
+    buckets = downloader._partition_filings_by_period(filings, "SECTION-6", "0000000001")
+
+    assert [bucket_key for bucket_key, _ in buckets] == ["2024-01", "2024-02"]
+    assert len(buckets[0][1]) == 2
+    assert len(buckets[1][1]) == 1
+
+
+def test_download_filings_uses_bucketed_period_distribution(tmp_path, monkeypatch):
+    downloader = SECDownloader(
+        user_name="Test",
+        user_agent_email="test@example.com",
+        data_dir=tmp_path / "data" / "raw_test",
+        max_workers=2,
+    )
+    subset = pd.DataFrame(
+        [
+            {
+                "CIK": "0001234567",
+                "Form Type": "13F-HR",
+                "Date Filed": "20240115",
+                "Filename": "edgar/data/1234567/0001234567-24-000001.txt",
+            },
+            {
+                "CIK": "0001234567",
+                "Form Type": "13F-HR",
+                "Date Filed": "20240210",
+                "Filename": "edgar/data/1234567/0001234567-24-000002.txt",
+            },
+            {
+                "CIK": "0001234567",
+                "Form Type": "13F-HR",
+                "Date Filed": "20240410",
+                "Filename": "edgar/data/1234567/0001234567-24-000003.txt",
+            },
+        ]
+    )
+
+    captured = {"bucket_keys": []}
+
+    original_partition = downloader._partition_filings_by_period
+
+    def wrapped_partition(filings, form_type, cik):
+        buckets = original_partition(filings, form_type, cik)
+        captured["bucket_keys"] = [key for key, _ in buckets]
+        return buckets
+
+    monkeypatch.setattr(downloader, "_partition_filings_by_period", wrapped_partition)
+
+    def fake_download_single_filing(cik, accession_number, form_type, save_raw=True):
+        return {
+            "cik": cik,
+            "accession_number": accession_number,
+            "form_type": form_type,
+            "download_date": "2024-01-01",
+            "raw_path": f"/tmp/{accession_number}.txt",
+            "url": f"https://example.test/{accession_number}",
+        }
+
+    monkeypatch.setattr(downloader, "_download_single_filing", fake_download_single_filing)
+
+    downloaded = downloader.download_filings(
+        cik="0001234567",
+        form_type="13F-HR",
+        start_year=2024,
+        end_year=2024,
+        show_progress=False,
+        index_data_subset=subset,
+    )
+
+    assert captured["bucket_keys"] == ["2024-Q1", "2024-Q2"]
+    assert len(downloaded) == 3
 
 
 def test_validate_filing_content_flags_supported_form():
@@ -561,5 +738,7 @@ def test_import_has_no_side_effects(monkeypatch, tmp_path):
 
 def test_manifest_excludes_local_datasets():
     manifest = Path("MANIFEST.in").read_text()
-    assert "my_sec_data" in manifest
-    assert "my_sec_raw_data" in manifest
+    # Output directories produced by demos must never ship in the sdist.
+    assert "demo_local_output" in manifest
+    assert "data_parsed" in manifest
+    assert "data_raw" in manifest

@@ -4,19 +4,45 @@ Extracts filing-level metadata, transactions, and holdings from ownershipDocumen
 """
 
 import re
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # used only for the Element / ParseError types
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+import defusedxml.ElementTree as DET  # Safe parser: no external entities, no DTDs
 import pandas as pd
+from defusedxml.common import DefusedXmlException
+
+from ..storage import CSVBackend
+from ..storage.base import StorageBackend
+
+_SEC16_DATASET = {
+    "filing_info": "filing_info_sec16",
+    "transactions": "transactions_sec16",
+    "holdings": "holdings_sec16",
+}
+_SEC16_KEY_COLS = {
+    "filing_info": ("ACCESSION_NUMBER",),
+    "transactions": (
+        "ACCESSION_NUMBER",
+        "TRANSACTION_DATE",
+        "SECURITY_TITLE",
+        "TRANSACTION_CODE",
+    ),
+    "holdings": ("ACCESSION_NUMBER", "SECURITY_TITLE"),
+}
 
 
 class FormSection16Parser:
     """Parse Section 16 Forms 3/4/5 filings into normalized CSV-friendly DataFrames."""
 
-    def __init__(self, output_dir: str = "./parsed_sec16"):
+    def __init__(
+        self,
+        output_dir: str = "./parsed_sec16",
+        backend: Optional[StorageBackend] = None,
+    ):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.backend: StorageBackend = backend if backend is not None else CSVBackend(self.output_dir)
 
     def parse_filing(self, content: str) -> Dict[str, pd.DataFrame]:
         """Parse a single Section 16 filing."""
@@ -28,36 +54,65 @@ class FormSection16Parser:
 
         transactions = self._parse_transactions(root, filing_info, issuer_info, owner_info, footnotes)
         holdings = self._parse_holdings(root, filing_info, issuer_info, owner_info, footnotes)
-        return {
-            "filing_info": filing_info,
-            "transactions": transactions,
-            "holdings": holdings
-        }
+        return {"filing_info": filing_info, "transactions": transactions, "holdings": holdings}
 
     def save_parsed_data(self, parsed_data: Dict[str, pd.DataFrame]):
-        """Persist parsed DataFrames to CSV with deduplication."""
-        output_map = {
-            "filing_info": ("sec16_info.csv", self._expected_info_columns()),
-            "transactions": ("sec16_transactions.csv", self._expected_transaction_columns()),
-            "holdings": ("sec16_holdings.csv", self._expected_holdings_columns())
+        """Persist parsed DataFrames via the configured storage backend."""
+        period_suffix = self._derive_period_suffix(parsed_data, granularity="month")
+        expected_col_map = {
+            "filing_info": self._expected_info_columns(),
+            "transactions": self._expected_transaction_columns(),
+            "holdings": self._expected_holdings_columns(),
         }
 
         for data_type, df in parsed_data.items():
             if df is None or df.empty:
                 continue
-
-            if data_type not in output_map:
+            dataset = _SEC16_DATASET.get(data_type)
+            if dataset is None:
                 continue
 
-            filename, expected_cols = output_map[data_type]
+            expected_cols = expected_col_map[data_type]
             df_to_save = df.copy()
-
             for col in expected_cols:
                 if col not in df_to_save.columns:
                     df_to_save[col] = pd.NA
-
             df_to_save = df_to_save.reindex(columns=expected_cols)
-            self._write_dataframe(self.output_dir / filename, df_to_save)
+
+            self.backend.upsert(
+                dataset,
+                period_suffix,
+                df_to_save,
+                key_cols=_SEC16_KEY_COLS[data_type],
+            )
+
+    def _derive_period_suffix(self, parsed_data: Dict[str, pd.DataFrame], granularity: str = "month") -> str:
+        """Derive a YYYY_Qn or YYYY_MM suffix from parsed DataFrames."""
+        candidate_columns = [
+            ("filing_info", ["PERIOD_OF_REPORT", "DATE_FILED"]),
+            ("transactions", ["PERIOD_OF_REPORT", "TRANSACTION_DATE"]),
+            ("holdings", ["PERIOD_OF_REPORT"]),
+        ]
+
+        for data_type, columns in candidate_columns:
+            df = parsed_data.get(data_type)
+            if df is None or df.empty:
+                continue
+            for col in columns:
+                if col not in df.columns:
+                    continue
+                values = df[col].dropna()
+                if values.empty:
+                    continue
+                dt = pd.to_datetime(values.iloc[0], errors="coerce")
+                if pd.isna(dt):
+                    continue
+                if granularity == "month":
+                    return f"{dt.year}_{dt.month:02d}"
+                quarter = ((dt.month - 1) // 3) + 1
+                return f"{dt.year}_Q{quarter}"
+
+        return "unknown_period"
 
     def _expected_info_columns(self) -> List[str]:
         return [
@@ -86,7 +141,7 @@ class FormSection16Parser:
             "REMARKS",
             "SEC_FILING_URL",
             "CREATED_AT",
-            "UPDATED_AT"
+            "UPDATED_AT",
         ]
 
     def _expected_transaction_columns(self) -> List[str]:
@@ -118,7 +173,7 @@ class FormSection16Parser:
             "UNDERLYING_SECURITY_SHARES",
             "FOOTNOTE_IDS",
             "CREATED_AT",
-            "UPDATED_AT"
+            "UPDATED_AT",
         ]
 
     def _expected_holdings_columns(self) -> List[str]:
@@ -143,60 +198,19 @@ class FormSection16Parser:
             "UNDERLYING_SECURITY_SHARES",
             "FOOTNOTE_IDS",
             "CREATED_AT",
-            "UPDATED_AT"
+            "UPDATED_AT",
         ]
-
-    def _write_dataframe(self, file_path: Path, df_to_save: pd.DataFrame) -> None:
-        """Append rows to CSV with deduplication (no concat FutureWarning)."""
-        if df_to_save is None:
-            return
-
-        expected_cols = list(df_to_save.columns)
-
-        def _nonempty(df: pd.DataFrame) -> pd.DataFrame:
-            df = df.dropna(how="all")
-            return df if not df.empty else pd.DataFrame(columns=expected_cols)
-
-        def _drop_all_na_cols(df: pd.DataFrame) -> pd.DataFrame:
-            # Avoid pandas FutureWarning: concat with all-NA columns
-            all_na_cols = [c for c in df.columns if df[c].isna().all()]
-            return df.drop(columns=all_na_cols) if all_na_cols else df
-
-        frames: list[pd.DataFrame] = []
-
-        if file_path.exists():
-            existing = pd.read_csv(file_path)
-            existing = existing.reindex(columns=expected_cols)
-            existing = _nonempty(existing)
-            if not existing.empty:
-                frames.append(_drop_all_na_cols(existing))
-
-        incoming = df_to_save.reindex(columns=expected_cols)
-        incoming = _nonempty(incoming)
-        if not incoming.empty:
-            frames.append(_drop_all_na_cols(incoming))
-
-        if not frames:
-            return
-
-        combined_df = pd.concat(frames, ignore_index=True)
-        combined_df = combined_df.reindex(columns=expected_cols)  # restore full schema
-        combined_df = combined_df.drop_duplicates()
-        combined_df.to_csv(file_path, index=False)
-
 
     def _get_xml_root(self, content: str) -> Optional[ET.Element]:
         """Extract and parse the ownershipDocument XML section."""
         try:
             match = re.search(
-                r"<ownershipDocument[^>]*>.*?</ownershipDocument>",
-                content,
-                re.DOTALL | re.IGNORECASE
+                r"<ownershipDocument[^>]*>.*?</ownershipDocument>", content, re.DOTALL | re.IGNORECASE
             )
             if not match:
                 return None
-            return ET.fromstring(match.group(0))
-        except ET.ParseError:
+            return DET.fromstring(match.group(0))
+        except (ET.ParseError, DefusedXmlException):
             return None
 
     def _parse_footnotes(self, root: Optional[ET.Element]) -> Dict[str, str]:
@@ -239,35 +253,39 @@ class FormSection16Parser:
             "REMARKS": self._find_text(root, ".//remarks"),
             "SEC_FILING_URL": pd.NA,
             "CREATED_AT": timestamp,
-            "UPDATED_AT": timestamp
+            "UPDATED_AT": timestamp,
         }
 
         issuer = self._get_issuer(root)
         owner = self._get_primary_reporting_owner(root)
 
         if issuer:
-            info.update({
-                "ISSUER_CIK": issuer.get("cik"),
-                "ISSUER_NAME": issuer.get("name"),
-                "ISSUER_TRADING_SYMBOL": issuer.get("trading_symbol")
-            })
+            info.update(
+                {
+                    "ISSUER_CIK": issuer.get("cik"),
+                    "ISSUER_NAME": issuer.get("name"),
+                    "ISSUER_TRADING_SYMBOL": issuer.get("trading_symbol"),
+                }
+            )
 
         if owner:
-            info.update({
-                "RPT_OWNER_CIK": owner.get("cik"),
-                "RPT_OWNER_NAME": owner.get("name"),
-                "RPT_OWNER_STREET1": owner.get("street1"),
-                "RPT_OWNER_STREET2": owner.get("street2"),
-                "RPT_OWNER_CITY": owner.get("city"),
-                "RPT_OWNER_STATE": owner.get("state"),
-                "RPT_OWNER_ZIP": owner.get("zip"),
-                "IS_DIRECTOR": owner.get("is_director"),
-                "IS_OFFICER": owner.get("is_officer"),
-                "OFFICER_TITLE": owner.get("officer_title"),
-                "IS_TEN_PCT_OWNER": owner.get("is_ten_pct"),
-                "IS_OTHER": owner.get("is_other"),
-                "OTHER_TEXT": owner.get("other_text")
-            })
+            info.update(
+                {
+                    "RPT_OWNER_CIK": owner.get("cik"),
+                    "RPT_OWNER_NAME": owner.get("name"),
+                    "RPT_OWNER_STREET1": owner.get("street1"),
+                    "RPT_OWNER_STREET2": owner.get("street2"),
+                    "RPT_OWNER_CITY": owner.get("city"),
+                    "RPT_OWNER_STATE": owner.get("state"),
+                    "RPT_OWNER_ZIP": owner.get("zip"),
+                    "IS_DIRECTOR": owner.get("is_director"),
+                    "IS_OFFICER": owner.get("is_officer"),
+                    "OFFICER_TITLE": owner.get("officer_title"),
+                    "IS_TEN_PCT_OWNER": owner.get("is_ten_pct"),
+                    "IS_OTHER": owner.get("is_other"),
+                    "OTHER_TEXT": owner.get("other_text"),
+                }
+            )
 
         df = pd.DataFrame([info])
         df["DATE_FILED"] = pd.to_datetime(df["DATE_FILED"], format="%Y%m%d", errors="coerce")
@@ -287,7 +305,7 @@ class FormSection16Parser:
         filing_info: pd.DataFrame,
         issuer: Dict[str, Any],
         owner: Dict[str, Any],
-        footnotes: Dict[str, str]
+        footnotes: Dict[str, str],
     ) -> pd.DataFrame:
         if root is None:
             return pd.DataFrame(columns=self._expected_transaction_columns())
@@ -301,17 +319,33 @@ class FormSection16Parser:
             row = base.copy()
             row["TABLE_TYPE"] = "NON_DERIVATIVE"
             row["SECURITY_TITLE"], f1 = self._text_with_fns(node, "securityTitle/value")
-            row["TRANSACTION_FORM_TYPE"], f2 = self._text_with_fns(node, "transactionCoding/transactionFormType")
+            row["TRANSACTION_FORM_TYPE"], f2 = self._text_with_fns(
+                node, "transactionCoding/transactionFormType"
+            )
             row["TRANSACTION_CODE"], f3 = self._text_with_fns(node, "transactionCoding/transactionCode")
-            row["EQUITY_SWAP_INVOLVED"], f4 = self._text_with_fns(node, "transactionCoding/equitySwapInvolved")
+            row["EQUITY_SWAP_INVOLVED"], f4 = self._text_with_fns(
+                node, "transactionCoding/equitySwapInvolved"
+            )
             row["TRANSACTION_DATE"], f5 = self._text_with_fns(node, "transactionDate/value")
             row["DEEMED_EXECUTION_DATE"], f6 = self._text_with_fns(node, "deemedExecutionDate/value")
-            row["TRANSACTION_SHARES"], f7 = self._text_with_fns(node, "transactionAmounts/transactionShares/value")
-            row["TRANSACTION_PRICE_PER_SHARE"], f8 = self._text_with_fns(node, "transactionAmounts/transactionPricePerShare/value")
-            row["SHARES_OWNED_FOLLOWING_TRANSACTION"], f9 = self._text_with_fns(node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value")
-            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f10 = self._text_with_fns(node, "ownershipNature/directOrIndirectOwnership/value")
-            row["NATURE_OF_OWNERSHIP"], f11 = self._text_with_fns(node, "ownershipNature/natureOfOwnership/value")
-            row["FOOTNOTE_IDS"] = self._combine_footnotes([f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, self._footnotes_from_node(node)], footnotes)
+            row["TRANSACTION_SHARES"], f7 = self._text_with_fns(
+                node, "transactionAmounts/transactionShares/value"
+            )
+            row["TRANSACTION_PRICE_PER_SHARE"], f8 = self._text_with_fns(
+                node, "transactionAmounts/transactionPricePerShare/value"
+            )
+            row["SHARES_OWNED_FOLLOWING_TRANSACTION"], f9 = self._text_with_fns(
+                node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+            )
+            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f10 = self._text_with_fns(
+                node, "ownershipNature/directOrIndirectOwnership/value"
+            )
+            row["NATURE_OF_OWNERSHIP"], f11 = self._text_with_fns(
+                node, "ownershipNature/natureOfOwnership/value"
+            )
+            row["FOOTNOTE_IDS"] = self._combine_footnotes(
+                [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, self._footnotes_from_node(node)], footnotes
+            )
             row["CREATED_AT"] = timestamp
             row["UPDATED_AT"] = timestamp
             rows.append(row)
@@ -321,24 +355,62 @@ class FormSection16Parser:
             row = base.copy()
             row["TABLE_TYPE"] = "DERIVATIVE"
             row["SECURITY_TITLE"], f1 = self._text_with_fns(node, "securityTitle/value")
-            row["TRANSACTION_FORM_TYPE"], f2 = self._text_with_fns(node, "transactionCoding/transactionFormType")
+            row["TRANSACTION_FORM_TYPE"], f2 = self._text_with_fns(
+                node, "transactionCoding/transactionFormType"
+            )
             row["TRANSACTION_CODE"], f3 = self._text_with_fns(node, "transactionCoding/transactionCode")
-            row["EQUITY_SWAP_INVOLVED"], f4 = self._text_with_fns(node, "transactionCoding/equitySwapInvolved")
+            row["EQUITY_SWAP_INVOLVED"], f4 = self._text_with_fns(
+                node, "transactionCoding/equitySwapInvolved"
+            )
             row["TRANSACTION_DATE"], f5 = self._text_with_fns(node, "transactionDate/value")
             row["DEEMED_EXECUTION_DATE"], f6 = self._text_with_fns(node, "deemedExecutionDate/value")
-            row["TRANSACTION_SHARES"], f7 = self._text_with_fns(node, "transactionAmounts/transactionShares/value")
-            row["TRANSACTION_PRICE_PER_SHARE"], f8 = self._text_with_fns(node, "transactionAmounts/transactionPricePerShare/value")
-            row["SHARES_OWNED_FOLLOWING_TRANSACTION"], f9 = self._text_with_fns(node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value")
-            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f10 = self._text_with_fns(node, "ownershipNature/directOrIndirectOwnership/value")
-            row["NATURE_OF_OWNERSHIP"], f11 = self._text_with_fns(node, "ownershipNature/natureOfOwnership/value")
-            row["CONVERSION_OR_EXERCISE_PRICE"], f12 = self._text_with_fns(node, "conversionOrExercisePrice/value")
+            row["TRANSACTION_SHARES"], f7 = self._text_with_fns(
+                node, "transactionAmounts/transactionShares/value"
+            )
+            row["TRANSACTION_PRICE_PER_SHARE"], f8 = self._text_with_fns(
+                node, "transactionAmounts/transactionPricePerShare/value"
+            )
+            row["SHARES_OWNED_FOLLOWING_TRANSACTION"], f9 = self._text_with_fns(
+                node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+            )
+            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f10 = self._text_with_fns(
+                node, "ownershipNature/directOrIndirectOwnership/value"
+            )
+            row["NATURE_OF_OWNERSHIP"], f11 = self._text_with_fns(
+                node, "ownershipNature/natureOfOwnership/value"
+            )
+            row["CONVERSION_OR_EXERCISE_PRICE"], f12 = self._text_with_fns(
+                node, "conversionOrExercisePrice/value"
+            )
             row["EXERCISE_DATE"], f13 = self._text_with_fns(node, "exerciseDate/value")
             row["EXPIRATION_DATE"], f14 = self._text_with_fns(node, "expirationDate/value")
-            row["UNDERLYING_SECURITY_TITLE"], f15 = self._text_with_fns(node, "underlyingSecurity/underlyingSecurityTitle/value")
-            row["UNDERLYING_SECURITY_SHARES"], f16 = self._text_with_fns(node, "underlyingSecurity/underlyingSecurityShares/value")
+            row["UNDERLYING_SECURITY_TITLE"], f15 = self._text_with_fns(
+                node, "underlyingSecurity/underlyingSecurityTitle/value"
+            )
+            row["UNDERLYING_SECURITY_SHARES"], f16 = self._text_with_fns(
+                node, "underlyingSecurity/underlyingSecurityShares/value"
+            )
             row["FOOTNOTE_IDS"] = self._combine_footnotes(
-                [f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12, f13, f14, f15, f16, self._footnotes_from_node(node)],
-                footnotes
+                [
+                    f1,
+                    f2,
+                    f3,
+                    f4,
+                    f5,
+                    f6,
+                    f7,
+                    f8,
+                    f9,
+                    f10,
+                    f11,
+                    f12,
+                    f13,
+                    f14,
+                    f15,
+                    f16,
+                    self._footnotes_from_node(node),
+                ],
+                footnotes,
             )
             row["CREATED_AT"] = timestamp
             row["UPDATED_AT"] = timestamp
@@ -348,12 +420,23 @@ class FormSection16Parser:
         if df.empty:
             return df
 
-        for date_col in ["TRANSACTION_DATE", "DEEMED_EXECUTION_DATE", "PERIOD_OF_REPORT", "EXERCISE_DATE", "EXPIRATION_DATE"]:
+        for date_col in [
+            "TRANSACTION_DATE",
+            "DEEMED_EXECUTION_DATE",
+            "PERIOD_OF_REPORT",
+            "EXERCISE_DATE",
+            "EXPIRATION_DATE",
+        ]:
             if date_col in df.columns:
                 df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
 
-        numeric_cols = ["TRANSACTION_SHARES", "TRANSACTION_PRICE_PER_SHARE", "SHARES_OWNED_FOLLOWING_TRANSACTION",
-                        "CONVERSION_OR_EXERCISE_PRICE", "UNDERLYING_SECURITY_SHARES"]
+        numeric_cols = [
+            "TRANSACTION_SHARES",
+            "TRANSACTION_PRICE_PER_SHARE",
+            "SHARES_OWNED_FOLLOWING_TRANSACTION",
+            "CONVERSION_OR_EXERCISE_PRICE",
+            "UNDERLYING_SECURITY_SHARES",
+        ]
         for col in numeric_cols:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -365,7 +448,7 @@ class FormSection16Parser:
         filing_info: pd.DataFrame,
         issuer: Dict[str, Any],
         owner: Dict[str, Any],
-        footnotes: Dict[str, str]
+        footnotes: Dict[str, str],
     ) -> pd.DataFrame:
         if root is None:
             return pd.DataFrame(columns=self._expected_holdings_columns())
@@ -378,10 +461,18 @@ class FormSection16Parser:
             row = base.copy()
             row["TABLE_TYPE"] = "NON_DERIVATIVE_HOLDING"
             row["SECURITY_TITLE"], f1 = self._text_with_fns(node, "securityTitle/value")
-            row["SHARES_OWNED"], f2 = self._text_with_fns(node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value")
-            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f3 = self._text_with_fns(node, "ownershipNature/directOrIndirectOwnership/value")
-            row["NATURE_OF_OWNERSHIP"], f4 = self._text_with_fns(node, "ownershipNature/natureOfOwnership/value")
-            row["FOOTNOTE_IDS"] = self._combine_footnotes([f1, f2, f3, f4, self._footnotes_from_node(node)], footnotes)
+            row["SHARES_OWNED"], f2 = self._text_with_fns(
+                node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+            )
+            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f3 = self._text_with_fns(
+                node, "ownershipNature/directOrIndirectOwnership/value"
+            )
+            row["NATURE_OF_OWNERSHIP"], f4 = self._text_with_fns(
+                node, "ownershipNature/natureOfOwnership/value"
+            )
+            row["FOOTNOTE_IDS"] = self._combine_footnotes(
+                [f1, f2, f3, f4, self._footnotes_from_node(node)], footnotes
+            )
             row["CREATED_AT"] = timestamp
             row["UPDATED_AT"] = timestamp
             rows.append(row)
@@ -390,17 +481,28 @@ class FormSection16Parser:
             row = base.copy()
             row["TABLE_TYPE"] = "DERIVATIVE_HOLDING"
             row["SECURITY_TITLE"], f1 = self._text_with_fns(node, "securityTitle/value")
-            row["SHARES_OWNED"], f2 = self._text_with_fns(node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value")
-            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f3 = self._text_with_fns(node, "ownershipNature/directOrIndirectOwnership/value")
-            row["NATURE_OF_OWNERSHIP"], f4 = self._text_with_fns(node, "ownershipNature/natureOfOwnership/value")
-            row["CONVERSION_OR_EXERCISE_PRICE"], f5 = self._text_with_fns(node, "conversionOrExercisePrice/value")
+            row["SHARES_OWNED"], f2 = self._text_with_fns(
+                node, "postTransactionAmounts/sharesOwnedFollowingTransaction/value"
+            )
+            row["DIRECT_OR_INDIRECT_OWNERSHIP"], f3 = self._text_with_fns(
+                node, "ownershipNature/directOrIndirectOwnership/value"
+            )
+            row["NATURE_OF_OWNERSHIP"], f4 = self._text_with_fns(
+                node, "ownershipNature/natureOfOwnership/value"
+            )
+            row["CONVERSION_OR_EXERCISE_PRICE"], f5 = self._text_with_fns(
+                node, "conversionOrExercisePrice/value"
+            )
             row["EXERCISE_DATE"], f6 = self._text_with_fns(node, "exerciseDate/value")
             row["EXPIRATION_DATE"], f7 = self._text_with_fns(node, "expirationDate/value")
-            row["UNDERLYING_SECURITY_TITLE"], f8 = self._text_with_fns(node, "underlyingSecurity/underlyingSecurityTitle/value")
-            row["UNDERLYING_SECURITY_SHARES"], f9 = self._text_with_fns(node, "underlyingSecurity/underlyingSecurityShares/value")
+            row["UNDERLYING_SECURITY_TITLE"], f8 = self._text_with_fns(
+                node, "underlyingSecurity/underlyingSecurityTitle/value"
+            )
+            row["UNDERLYING_SECURITY_SHARES"], f9 = self._text_with_fns(
+                node, "underlyingSecurity/underlyingSecurityShares/value"
+            )
             row["FOOTNOTE_IDS"] = self._combine_footnotes(
-                [f1, f2, f3, f4, f5, f6, f7, f8, f9, self._footnotes_from_node(node)],
-                footnotes
+                [f1, f2, f3, f4, f5, f6, f7, f8, f9, self._footnotes_from_node(node)], footnotes
             )
             row["CREATED_AT"] = timestamp
             row["UPDATED_AT"] = timestamp
@@ -419,10 +521,7 @@ class FormSection16Parser:
         return df
 
     def _transaction_base_row(
-        self,
-        filing_info: pd.DataFrame,
-        issuer: Dict[str, Any],
-        owner: Dict[str, Any]
+        self, filing_info: pd.DataFrame, issuer: Dict[str, Any], owner: Dict[str, Any]
     ) -> Dict[str, Any]:
         accession = filing_info["ACCESSION_NUMBER"].iloc[0] if not filing_info.empty else pd.NA
         period = filing_info["PERIOD_OF_REPORT"].iloc[0] if not filing_info.empty else pd.NA
@@ -435,14 +534,11 @@ class FormSection16Parser:
             "ISSUER_NAME": issuer.get("name") if issuer else pd.NA,
             "ISSUER_TRADING_SYMBOL": issuer.get("trading_symbol") if issuer else pd.NA,
             "RPT_OWNER_CIK": owner.get("cik") if owner else pd.NA,
-            "RPT_OWNER_NAME": owner.get("name") if owner else pd.NA
+            "RPT_OWNER_NAME": owner.get("name") if owner else pd.NA,
         }
 
     def _holdings_base_row(
-        self,
-        filing_info: pd.DataFrame,
-        issuer: Dict[str, Any],
-        owner: Dict[str, Any]
+        self, filing_info: pd.DataFrame, issuer: Dict[str, Any], owner: Dict[str, Any]
     ) -> Dict[str, Any]:
         accession = filing_info["ACCESSION_NUMBER"].iloc[0] if not filing_info.empty else pd.NA
         period = filing_info["PERIOD_OF_REPORT"].iloc[0] if not filing_info.empty else pd.NA
@@ -455,7 +551,7 @@ class FormSection16Parser:
             "ISSUER_NAME": issuer.get("name") if issuer else pd.NA,
             "ISSUER_TRADING_SYMBOL": issuer.get("trading_symbol") if issuer else pd.NA,
             "RPT_OWNER_CIK": owner.get("cik") if owner else pd.NA,
-            "RPT_OWNER_NAME": owner.get("name") if owner else pd.NA
+            "RPT_OWNER_NAME": owner.get("name") if owner else pd.NA,
         }
 
     def _get_issuer(self, root: Optional[ET.Element]) -> Dict[str, Any]:
@@ -467,7 +563,7 @@ class FormSection16Parser:
         return {
             "cik": self._find_text(issuer_node, ".//issuerCik"),
             "name": self._find_text(issuer_node, ".//issuerName"),
-            "trading_symbol": self._find_text(issuer_node, ".//issuerTradingSymbol")
+            "trading_symbol": self._find_text(issuer_node, ".//issuerTradingSymbol"),
         }
 
     def _get_primary_reporting_owner(self, root: Optional[ET.Element]) -> Dict[str, Any]:
@@ -481,8 +577,12 @@ class FormSection16Parser:
         return {
             "cik": self._find_text(owner_node, ".//rptOwnerCik"),
             "name": self._find_text(owner_node, ".//rptOwnerName"),
-            "street1": self._find_text(address_node, ".//rptOwnerStreet1") if address_node is not None else None,
-            "street2": self._find_text(address_node, ".//rptOwnerStreet2") if address_node is not None else None,
+            "street1": self._find_text(address_node, ".//rptOwnerStreet1")
+            if address_node is not None
+            else None,
+            "street2": self._find_text(address_node, ".//rptOwnerStreet2")
+            if address_node is not None
+            else None,
             "city": self._find_text(address_node, ".//rptOwnerCity") if address_node is not None else None,
             "state": self._find_text(address_node, ".//rptOwnerState") if address_node is not None else None,
             "zip": self._find_text(address_node, ".//rptOwnerZipCode") if address_node is not None else None,
@@ -491,7 +591,7 @@ class FormSection16Parser:
             "officer_title": self._find_text(rel_node, ".//officerTitle") if rel_node is not None else None,
             "is_ten_pct": self._find_text(rel_node, ".//isTenPercentOwner") if rel_node is not None else None,
             "is_other": self._find_text(rel_node, ".//isOther") if rel_node is not None else None,
-            "other_text": self._find_text(rel_node, ".//otherText") if rel_node is not None else None
+            "other_text": self._find_text(rel_node, ".//otherText") if rel_node is not None else None,
         }
 
     def _text_with_fns(self, element: ET.Element, path: str) -> Tuple[Optional[str], Set[str]]:

@@ -3,8 +3,6 @@ include README.md
 include pyproject.toml
 
 recursive-include piboufilings *.py
-recursive-include piboufilings/config *.json
-recursive-include piboufilings/config *.yaml
 
 global-exclude __pycache__
 global-exclude *.py[cod]
@@ -12,7 +10,10 @@ global-exclude *.so
 global-exclude .DS_Store
 global-exclude .git
 global-exclude .gitignore
-recursive-exclude my_sec_data *
-recursive-exclude my_sec_raw_data *
-recursive-exclude my_sec_logs *
-global-exclude logs/
+recursive-exclude demo_local_logs *
+recursive-exclude demo_local_output *
+recursive-exclude demo_local_raw *
+recursive-exclude logs *
+recursive-exclude out *
+recursive-exclude data_parsed *
+recursive-exclude data_raw *

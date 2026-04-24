@@ -3,12 +3,20 @@
 <h3 style="text-align: center;">A Python library to download, parse, and analyze SEC EDGAR filings at scale. </h3>
 
 [![PyPI](https://img.shields.io/pypi/v/piboufilings?color=blue)](https://pypi.org/project/piboufilings/)
+[![Python](https://img.shields.io/pypi/pyversions/piboufilings?color=blue)](https://pypi.org/project/piboufilings/)
 [![License](https://img.shields.io/badge/License-Non_Commercial-blue)](./LICENCE)
 [![Downloads](https://img.shields.io/pepy/dt/piboufilings?color=blue)](https://pepy.tech/projects/piboufilings)
 [![Open In Google Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/14CGkio1NVXI6pkuPliAmdBL4sT8u6H-t#scrollTo=wk3GmLlhbidZ)
 
 ---
 
+> **What's new in 0.5.0** — Parsed data now lands in a **DuckDB** file by
+> default (one table per dataset, PK-based dedup, crash-safe). Pass
+> `export_format="csv"` to keep the legacy period-partitioned CSV files.
+> See [CHANGELOG.md](./CHANGELOG.md) for the full list and migration guide.
+>
+> `0.5.0` is still pre-1.0 (Alpha). The data schemas are stable; the public
+> API may evolve.
 
 ## Filing Contents at a Glance
 
@@ -23,12 +31,18 @@ Unlock structured, analysis-ready data from the SEC’s filings:
 ## Installation
 
 ```bash
+# Default: DuckDB output (recommended for large runs)
+pip install 'piboufilings[duckdb]'
+
+# Or the minimal install if you only need the CSV fallback
 pip install piboufilings
 ```
 
+`piboufilings` writes parsed filings through a pluggable storage layer. The default backend is **DuckDB** (single `piboufilings.duckdb` file at `base_dir`), which scales to tens of millions of holdings rows. The legacy **CSV** backend is still available via `export_format="csv"`.
+
 ## Quick Start
 
-The primary way to use `piboufilings` is with the `get_filings()` function:
+The primary entry point is `get_filings()`:
 
 ```python
 from piboufilings import get_filings
@@ -44,17 +58,53 @@ get_filings(
     form_type=["13F-HR", "NPORT-P", "SECTION-6"],# String or list of strings
     start_year=2020,
     end_year=2025,
-    base_dir="./my_sec_data",       # Optional: Custom directory for parsed CSVs
-    log_dir="./my_sec_logs",        # Optional: Custom directory for logs
-    raw_data_dir="./my_sec_raw_data",# Optional: Custom directory for raw filings
+    base_dir="./my_sec_data",       # Where parsed data is written
+    log_dir="./my_sec_logs",        # Where operation logs go
+    raw_data_dir="./my_sec_raw_data",# Where raw .txt filings are cached
     keep_raw_files=True,            # Set to False to delete raw .txt files after parsing
-    max_workers=5                   # Parallel workers for downloads/parsing
+    max_workers=5,                  # Parallel workers (auto bucketed: quarterly for 13F, monthly for NPORT/Section16)
+    export_format="duckdb",         # "duckdb" (default) or "csv"
 )
 ```
 
-After running, parsed data will be written to `./my_sec_data` (or `./data_parsed` by default) and logs to `./my_sec_logs` (or `./logs`). Raw filings default to `./data_raw/<identifier>/<form>/<accession>/`; set `raw_data_dir` to place them elsewhere (e.g., `./my_sec_raw_data/<identifier>/<form>/<accession>/`).
+After running with `export_format="duckdb"` (the default), parsed data lands in a single DuckDB database at `./my_sec_data/piboufilings.duckdb`. Each filing dataset becomes a SQL table; dedup is enforced by primary key so reruns are idempotent. If you prefer period-partitioned CSV files instead, pass `export_format="csv"` and the legacy filenames (`13f_holdings_YYYY_Qn.csv`, `nport_holdings_YYYY_MM.csv`, etc.) are written under `base_dir`.
+
+Logs go to `./my_sec_logs` (or `./logs` by default). Raw filings default to `./data_raw/<identifier>/<form>/<accession>/`; set `raw_data_dir` to place them elsewhere.
+
+### Querying the DuckDB output
+
+```python
+import duckdb
+
+con = duckdb.connect("./my_sec_data/piboufilings.duckdb")
+con.execute("SELECT COUNT(*) FROM holdings_13f").fetchone()
+con.sql("""
+    SELECT NAME_OF_ISSUER, SUM(SHARE_VALUE) AS total_value
+    FROM holdings_13f
+    WHERE CONFORMED_DATE >= '2024-01-01'
+    GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+""").df()
+```
 
 CIK number can be obtained from [SEC EDGAR Search Filings](https://www.sec.gov/search-filings).
+
+### Recovery & resume
+
+If `get_filings` is interrupted (Ctrl-C, OOM, network failure, SEC 5xx),
+re-running the same command is safe and efficient: by default (`resume=True`)
+the orchestrator skips anything already fully processed.
+
+- **Level A** — if the accession is already in the storage backend's
+  `filing_info_*` table, both the download and the parse are skipped.
+- **Level B** — if the raw `.txt` is still on disk at `raw_data_dir` but
+  missing from the backend (e.g. parse crashed after download), the HTTP
+  call is skipped and the filing is re-parsed from disk.
+- Pass `resume=False` to force a full re-fetch (e.g. after a parser
+  schema change).
+
+Skips are audited in the operations log (`DOWNLOAD_SKIPPED_KNOWN`,
+`DOWNLOAD_SKIPPED_RAW_EXISTS`) and counted in a per-form
+`RESUME_KNOWN_ACCESSIONS` summary.
 
 ---
 
@@ -82,28 +132,45 @@ This structure lets you link back any security-level data to the registered fili
 -   **Smart Parsing:**
     -   `Form13FParser`: Extracts detailed holdings and cover page data (including `IRS_NUMBER` and `SEC_FILE_NUMBER`) from 13F-HR filings.
     -   `FormNPORTParser`: Parses comprehensive fund/filer information (including `IRS_NUMBER` and `SEC_FILE_NUMBER`) and security holdings from N-PORT-P filings.
-    -   `FormSection16Parser`: Normalizes Section 16 ownership XML (Forms 3/4/5) into filing-, transaction-, and holdings-level DataFrames (backed by the `sec16_*.csv` outputs).
--   **Structured CSV Output:**
-    -   `13f_info.csv`: Filer information, summary fields, and a `SEC_FILING_URL` back to the original document.
-    -   `13f_holdings.csv`: Aggregated holdings data from all processed 13F forms (including the reported CUSIP where available).
-    -   `13f_other_managers_reporting.csv`: List of “other managers reporting for this manager” taken from each 13F cover page.
-    -   `13f_other_included_managers.csv`: Detailed mapping of numbered “other included managers” so holdings can be joined back to the entities referenced in the table footers.
-    -   `nport_filing_info.csv`: Fund/filer information and summaries for N-PORT forms.
-    -   `nport_holdings.csv`: Aggregated holdings data from all processed N-PORT forms (includes CUSIP where provided).
-    -   `sec16_info.csv`: Filing-level metadata plus issuer/reporting-owner identifiers and role flags for Forms 3/4/5 (alias `SECTION-6`).
-    -   `sec16_transactions.csv`: Line-item insider transactions (non-derivative and derivative tables), including codes, dates, share amounts, prices, and post-transaction balances.
-    -   `sec16_holdings.csv`: End-of-period holdings snapshots from the Section 16 tables, aligned with issuer and owner identifiers.
+    -   `FormSection16Parser`: Normalizes Section 16 ownership XML (Forms 3/4/5) into filing-, transaction-, and holdings-level DataFrames (written to `filing_info_sec16` / `transactions_sec16` / `holdings_sec16` tables, or the equivalent `sec16_*.csv` files under the CSV backend).
+-   **Two storage backends (same schemas):**
+    -   **DuckDB** (`export_format="duckdb"`, default) — one `piboufilings.duckdb` file at `base_dir`, with one SQL table per dataset and primary-key-based deduplication. Crash-safe across interrupted runs; queryable from DuckDB, Python, pandas, SQL, or any tool that speaks `.duckdb`.
+    -   **CSV** (`export_format="csv"`) — legacy period-partitioned files under `base_dir`, identical column schema to the DuckDB tables.
+
+    **Dataset → DuckDB table / CSV filename mapping**
+
+    | Dataset                   | DuckDB table                     | CSV filename (period-partitioned)               |
+    |---------------------------|----------------------------------|-------------------------------------------------|
+    | 13F filing info           | `filing_info_13f`                | `13f_info_YYYY_Qn.csv`                          |
+    | 13F holdings              | `holdings_13f`                   | `13f_holdings_YYYY_Qn.csv`                      |
+    | 13F other managers reporting | `other_managers_reporting_13f` | `13f_other_managers_reporting_YYYY_Qn.csv`     |
+    | 13F other included managers  | `other_included_managers_13f`  | `13f_other_included_managers_YYYY_Qn.csv`      |
+    | N-PORT filing info        | `filing_info_nport`              | `nport_filing_info_YYYY_MM.csv`                 |
+    | N-PORT holdings           | `holdings_nport`                 | `nport_holdings_YYYY_MM.csv`                    |
+    | Section 16 filing info    | `filing_info_sec16`              | `sec16_info_YYYY_MM.csv`                        |
+    | Section 16 transactions   | `transactions_sec16`             | `sec16_transactions_YYYY_MM.csv`                |
+    | Section 16 holdings       | `holdings_sec16`                 | `sec16_holdings_YYYY_MM.csv`                    |
+
+    Column names and meanings are the same across both backends — see the **Field Reference** below.
 -   **Robust EDGAR Interaction:**
     -   Adheres to SEC rate limits (10 req/sec) via a configurable global token bucket rate limiter.
     -   Comprehensive retry mechanism for network requests (handles connection errors, read errors, and specific HTTP status codes like 429, 5xx).
 -   **Efficient & Configurable:**
     -   Parallelized downloads using `ThreadPoolExecutor` for faster processing of CIKs with multiple filings.
+    -   **Mandatory auto-partitioned worker distribution (no legacy mixed-file scheduling):**
+        - 13F workers process **independent quarter buckets** (`YYYY-Qn`).
+        - Section 16 workers process **independent month buckets** (`YYYY-MM`).
+        - N-PORT workers process **independent month buckets** (`YYYY-MM`).
+        - This design prevents workers from contending over the same time slice and reduces file-level conflicts.
+    -   **Multi-progress display for downloads:**
+        - One global progress bar tracks all filings for the CIK.
+        - One worker/bucket progress bar is shown per period (quarter/month), so each worker reports independently.
     -   Option to `keep_raw_files` (default True) or delete them after processing.
     -   Customizable directories for data and logs.
 -   **Detailed Logging:**
     -   Records operations to a daily CSV log file (e.g., `logs/filing_operations_YYYYMMDD.csv`).
     -   Logs include timestamps, descriptive `operation_type` (e.g., `DOWNLOAD_SINGLE_FILING_SUCCESS`), CIK, accession number, success/failure status, error messages, and specific `error_code` (like HTTP status codes) where applicable.
--   **Data Analytics Ready:** Pandas DataFrames are used internally and for the final CSV outputs.
+-   **Data Analytics Ready:** Pandas DataFrames internally; DuckDB and CSV outputs share identical column schemas.
 -   **Handles Amendments:** Automatically processes and correctly identifies amended filings (e.g., `13F-HR/A`, `NPORT-P/A`).
 
 
@@ -118,10 +185,12 @@ This structure lets you link back any security-level data to the registered fili
 
 ## Field Reference
 
-<details>
-<summary> 13f_info.csv </summary>
+Column names below apply to **both** the DuckDB tables and the CSV files — they share the same schema (see the mapping table above). The headings use the CSV filename for readability.
 
-### `13f_info.csv`
+<details>
+<summary> 13f_info_YYYY_Qn.csv </summary>
+
+### `13f_info_YYYY_Qn.csv`
 | Column | Description |
 | --- | --- |
 | `CIK` | Central Index Key for the registrant (10-digit, zero padded). |
@@ -153,9 +222,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> 13f_holdings.csv </summary>
+<summary> 13f_holdings_YYYY_Qn.csv </summary>
 
-### `13f_holdings.csv`
+### `13f_holdings_YYYY_Qn.csv`
 | Column | Description |
 | --- | --- |
 | `SEC_FILE_NUMBER` | File number of the reporting manager for the holding. |
@@ -176,9 +245,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> nport_filing_info.csv </summary>
+<summary> nport_filing_info_YYYY_MM.csv </summary>
 
-### `nport_filing_info.csv`
+### `nport_filing_info_YYYY_MM.csv`
 | Column | Description |
 | --- | --- |
 | `ACCESSION_NUMBER` | EDGAR accession number for the N-PORT filing. |
@@ -253,9 +322,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> nport_holdings.csv </summary>
+<summary> nport_holdings_YYYY_MM.csv </summary>
 
-### `nport_holdings.csv`
+### `nport_holdings_YYYY_MM.csv`
 | Column | Description |
 | --- | --- |
 | `ACCESSION_NUMBER` | Accession number of the N-PORT filing this holding comes from. |
@@ -295,9 +364,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> sec16_info.csv </summary>
+<summary> sec16_info_YYYY_MM.csv </summary>
 
-### `sec16_info.csv`
+### `sec16_info_YYYY_MM.csv`
 | Column | Description |
 | --- | --- |
 | `ACCESSION_NUMBER` | EDGAR accession number for the Section 16 filing. |
@@ -329,9 +398,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> sec16_transactions.csv </summary>
+<summary> sec16_transactions_YYYY_MM.csv </summary>
 
-### `sec16_transactions.csv`
+### `sec16_transactions_YYYY_MM.csv`
 | Column | Description |
 | --- | --- |
 | `ACCESSION_NUMBER` | Accession number of the filing this transaction comes from. |
@@ -365,9 +434,9 @@ This structure lets you link back any security-level data to the registered fili
 </details>
 
 <details>
-<summary> sec16_holdings.csv </summary>
+<summary> sec16_holdings_YYYY_MM.csv </summary>
 
-### `sec16_holdings.csv`
+### `sec16_holdings_YYYY_MM.csv`
 | Column | Description |
 | --- | --- |
 | `ACCESSION_NUMBER` | Accession number of the filing this holding comes from. |
@@ -393,7 +462,70 @@ This structure lets you link back any security-level data to the registered fili
 
 </details>
 <br>
-The helper CSVs `13f_other_managers_reporting.csv` and `13f_other_included_managers.csv` mirror the tables from each cover page and contain the SEC file numbers and names necessary to interpret the numbered manager references that appear in the holdings.
+The helper CSVs `13f_other_managers_reporting_YYYY_Qn.csv` and `13f_other_included_managers_YYYY_Qn.csv` mirror the tables from each cover page and contain the SEC file numbers and names necessary to interpret the numbered manager references that appear in the holdings.
+
+---
+
+## Troubleshooting
+
+**`ImportError: DuckDB is not installed…`**
+You installed `piboufilings` without the `[duckdb]` extra, but called
+`get_filings(...)` with the default `export_format="duckdb"`. Either install
+the extra (`pip install 'piboufilings[duckdb]'`) or pass
+`export_format="csv"`.
+
+**`ValueError: Unknown export_format 'parquet'`**
+Only `"duckdb"` and `"csv"` are supported in 0.5. File an issue if you'd
+like another backend.
+
+**SEC returns `HTTP 429` under high parallelism**
+The built-in rate limiter targets ~7 req/s (10 req/s SEC cap × 0.7 safety).
+If you see 429s, lower `max_workers` or run the workload over fewer CIKs.
+Retries with exponential backoff are handled automatically.
+
+**Download stalls or my disk fills up**
+The legacy CSV append path was quadratic in existing row count. Upgrade to
+0.5.0 and use the DuckDB backend (the default). See the
+[CHANGELOG](./CHANGELOG.md).
+
+**`FileNotFoundError` on the log directory**
+Fixed in 0.5.0 — `FilingLogger` now creates missing parent directories.
+Older versions required the parent to exist.
+
+**`ConnectionException: Can't open a connection to same database file with a different configuration than existing connections`**
+DuckDB keeps a process-wide instance cache — if you opened the DB in
+read-write mode (for example by calling `get_filings(...)`), you can't
+reopen the same file with a *different* config in the same Python process
+until the first connection is dropped.
+
+- In notebooks, open the DB with the default read-write config (omit
+  `read_only=True`) and call `con.close()` when done with the peek cell.
+- Or restart the kernel to reset all connections.
+- In library code, call `backend.close()` (0.5.0 drops its reference to the
+  connection so the next `duckdb.connect(...)` can use any config).
+
+**My operations-log CSV has an unexpected `level` column**
+New in 0.5.0 — second column is now `level` (`INFO`/`WARN`/`ERROR`/`DEBUG`).
+Read the CSV with `pandas.read_csv` and address columns by name rather than
+position.
+
+**I restarted after a crash and most filings are being skipped — is that right?**
+Yes. As of 0.6.0, `get_filings` defaults to `resume=True`. On a re-run, any
+filing whose accession is already in your storage backend is skipped (no
+HTTP call, no parse). Check the operations log for
+`DOWNLOAD_SKIPPED_KNOWN` entries. If you deliberately want a full
+re-fetch — for example, after upgrading and needing to pick up new
+parser columns — pass `resume=False`.
+
+**My filings all have empty `NAME_OF_ISSUER` / zero rows**
+Before 0.5.0, a single non-numeric cell in a 13F `<value>` or `<sshPrnamt>`
+element would silently wipe the entire holdings DataFrame for that filing.
+Fixed — bad cells become `<NA>` and a warning is logged; the rest of the
+filing is preserved.
+
+**Integration tests are failing in CI**
+They're opt-in as of 0.5.0 — triggered by the nightly schedule or manual
+`workflow_dispatch`. PRs don't hit live SEC.
 
 ---
 
