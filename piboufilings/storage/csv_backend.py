@@ -22,6 +22,8 @@ def _is_missing(val: Any) -> bool:
         if pd.isna(val):
             return True
     except (TypeError, ValueError):
+        # pd.isna raises on unhashable/array-like values we don't care about
+        # (e.g. lists, dicts) — they're clearly not missing, fall through.
         pass
     if isinstance(val, str):
         stripped = val.strip().upper()
@@ -138,7 +140,7 @@ class CSVBackend:
 
     def _upsert_key_dedup(self, path: Path, df: pd.DataFrame, key_cols: list[str]) -> None:
         """Dedup by natural key (keep-first across existing + incoming)."""
-        columns = list(df.columns)
+        existing_cols: list[str] = []
         records: Dict[tuple, Dict[str, Any]] = {}
 
         def _norm_key(row: Dict[str, Any]) -> tuple:
@@ -146,6 +148,8 @@ class CSVBackend:
 
         if path.exists():
             for chunk in pd.read_csv(path, chunksize=50000):
+                if not existing_cols:
+                    existing_cols = list(chunk.columns)
                 for _, row in chunk.iterrows():
                     rec = row.to_dict()
                     records.setdefault(_norm_key(rec), rec)
@@ -157,6 +161,7 @@ class CSVBackend:
         if not records:
             return
 
+        columns = list(dict.fromkeys([*existing_cols, *df.columns]))
         pd.DataFrame(records.values()).reindex(columns=columns).to_csv(path, index=False)
 
     def _upsert_prefer_non_null(
@@ -170,7 +175,7 @@ class CSVBackend:
 
         Preserves the NPORT "prefer the row with a CUSIP" semantics.
         """
-        columns = list(df.columns)
+        existing_cols: list[str] = []
         records: Dict[tuple, Dict[str, Any]] = {}
 
         def _norm_key(row: Dict[str, Any]) -> tuple:
@@ -189,6 +194,8 @@ class CSVBackend:
 
         if path.exists():
             for chunk in pd.read_csv(path, chunksize=50000):
+                if not existing_cols:
+                    existing_cols = list(chunk.columns)
                 for _, row in chunk.iterrows():
                     _add(row.to_dict())
 
@@ -198,4 +205,5 @@ class CSVBackend:
         if not records:
             return
 
+        columns = list(dict.fromkeys([*existing_cols, *df.columns]))
         pd.DataFrame(records.values()).reindex(columns=columns).to_csv(path, index=False)

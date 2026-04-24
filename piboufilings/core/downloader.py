@@ -791,9 +791,6 @@ class SECDownloader:
                 r"edgar/data/(\d+)/([0-9\-]+)\.txt"
             )
 
-            # Clean up accession number (remove .txt if present)
-            df_all["accession_number"] = df_all["accession_number"].str.replace(".txt", "")
-
             # Zero-pad CIK to 10 digits
             df_all["CIK"] = df_all["CIK_extracted"].str.zfill(10)
 

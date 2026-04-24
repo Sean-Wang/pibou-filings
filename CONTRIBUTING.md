@@ -17,7 +17,7 @@ source .venv/bin/activate         # Windows: .venv\Scripts\activate
 pip install -e ".[duckdb,test,lint]"
 ```
 
-Minimum Python: **3.9**. CI runs 3.9, 3.10, 3.11, 3.12, 3.13.
+Minimum Python: **3.10**. CI runs 3.10, 3.11, 3.12, 3.13.
 
 ## Running the local CI
 

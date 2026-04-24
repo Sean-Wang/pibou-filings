@@ -56,7 +56,6 @@ def test_default_start_year_uses_wall_clock_year(monkeypatch, tmp_path):
     current calendar year. Freeze time so the test never breaks on New Year's
     Eve."""
     import piboufilings
-    import piboufilings.core.downloader as downloader_module
 
     captured = {}
 
@@ -67,7 +66,7 @@ def test_default_start_year_uses_wall_clock_year(monkeypatch, tmp_path):
             columns=["CIK", "Name", "Date Filed", "Form Type", "accession_number", "Filename"]
         )
 
-    monkeypatch.setattr(downloader_module.SECDownloader, "get_sec_index_data", fake_get_index)
+    monkeypatch.setattr(SECDownloader, "get_sec_index_data", fake_get_index)
 
     piboufilings.get_filings(
         user_name="X",

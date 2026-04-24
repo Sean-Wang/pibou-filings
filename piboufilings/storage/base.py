@@ -31,7 +31,6 @@ class StorageBackend(Protocol):
             prefer_non_null: If set, on key collision prefer the row whose
                 value in this column is non-null (used for NPORT CUSIP preference).
         """
-        ...
 
     def known_accessions(self, form_type: str) -> set[str]:
         """Return accession numbers already persisted for this form's filing_info.
@@ -44,11 +43,9 @@ class StorageBackend(Protocol):
         Accession numbers are returned in SEC's hyphenated form
         (``NNNNNNNNNN-YY-NNNNNN``), matching what the downloader passes in.
         """
-        ...
 
     def close(self) -> None:
         """Flush and release resources."""
-        ...
 
 
 # Maps the logical dataset name used by parsers/backends to the CSV filename

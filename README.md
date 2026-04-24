@@ -510,7 +510,7 @@ Read the CSV with `pandas.read_csv` and address columns by name rather than
 position.
 
 **I restarted after a crash and most filings are being skipped — is that right?**
-Yes. As of 0.6.0, `get_filings` defaults to `resume=True`. On a re-run, any
+Yes. As of 0.5.0, `get_filings` defaults to `resume=True`. On a re-run, any
 filing whose accession is already in your storage backend is skipped (no
 HTTP call, no parse). Check the operations log for
 `DOWNLOAD_SKIPPED_KNOWN` entries. If you deliberately want a full

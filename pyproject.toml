@@ -7,7 +7,7 @@ name = "piboufilings"
 dynamic = ["version"]
 description = "A Python library for downloading and parsing SEC EDGAR filings"
 readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = {file = "LICENCE"}
 authors = [
     {name = "Pierre Bouquet", email = "pierrebouquet73000@gmail.com"},
@@ -19,7 +19,6 @@ classifiers = [
     "License :: Other/Proprietary License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -80,7 +79,7 @@ markers = [
 
 [tool.ruff]
 line-length = 110
-target-version = "py39"
+target-version = "py310"
 extend-exclude = [
     "demo_local_logs",
     "demo_local_output",
@@ -108,6 +107,7 @@ ignore = [
     # PEP 585 / PEP 604 style: deferred until we standardize on
     # `from __future__ import annotations` across the codebase.
     "UP006",   # typing.List → list (requires 3.9 runtime OR future import)
+    "UP007",   # Union[X, Y] → X | Y (PEP 604, deferred with UP045)
     "UP035",   # deprecated typing imports
     "UP045",   # Optional[X] → X | None (requires 3.10 or future import)
     "E402",    # module import not at top — we intentionally place module
@@ -119,7 +119,7 @@ ignore = [
 "tests/*" = ["B011", "E741"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true

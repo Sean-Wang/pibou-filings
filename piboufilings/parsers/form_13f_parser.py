@@ -361,7 +361,7 @@ class Form13FParser:
             xml_start_tags = [match.start() for match in re.finditer(r"<XML>", content)]
             xml_end_tags = [match.start() for match in re.finditer(r"</XML>", content)]
 
-            xml_indices = list(zip(xml_start_tags, xml_end_tags))
+            xml_indices = list(zip(xml_start_tags, xml_end_tags, strict=False))
 
             if xml_indices:
                 # Use the second XML section (index 1) as it typically contains the holdings data

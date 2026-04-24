@@ -177,6 +177,7 @@ def _build_raw_index(raw_root: Path) -> dict:
             path.relative_to(cache_dir)
             continue
         except ValueError:
+            # Not under cache_dir — this is a real filing path, keep processing.
             pass
         accession = path.parent.name
         # Sanity: accession numbers look like ``NNNNNNNNNN-YY-NNNNNN``.
