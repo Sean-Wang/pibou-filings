@@ -2,29 +2,26 @@
 piboufilings - A Python library for downloading and parsing SEC EDGAR filings.
 """
 
-from typing import Optional, List, Dict, Any, Union
-import pandas as pd
-from datetime import datetime
 import os
+import re
+from datetime import datetime
 from pathlib import Path
-from tqdm import tqdm
-import requests
+from typing import List, Optional, Union
 
-from .core.downloader import SECDownloader, resolve_io_paths, normalize_filters
+import pandas as pd
+import requests
+from tqdm import tqdm
+
+from ._version import __version__
+from .core.downloader import SECDownloader, normalize_filters, resolve_io_paths
 from .core.logger import FilingLogger
 from .parsers.form_13f_parser import Form13FParser
 from .parsers.form_nport_parser import FormNPORTParser
 from .parsers.form_sec16_parser import FormSection16Parser
 from .parsers.parser_utils import validate_filing_content
-from .config.settings import DATA_DIR
+from .storage import StorageBackend, get_backend
 
-try:
-    from ._version import __version__ as package_version
-except ImportError:
-    try:
-        from .version import __version__ as package_version
-    except ImportError:
-        package_version = "0.4.0" # Fallback
+package_version = __version__
 
 
 SECTION16_ALIAS = "SECTION-6"
@@ -40,209 +37,375 @@ def _normalize_form_type(form_type: str) -> str:
 
 
 ### IF YOU'RE BUILDING A NEW PARSER, YOU'LL NEED TO UPDATE THIS FUNCTION ###
-def get_parser_for_form_type_internal(form_type: str, base_dir: str):
-    """Get the appropriate parser for a form type using the new restructured parsers."""
+def get_parser_for_form_type_internal(
+    form_type: str,
+    base_dir: str,
+    backend: Optional[StorageBackend] = None,
+):
+    """Get the appropriate parser for a form type using the new restructured parsers.
+
+    If ``backend`` is omitted, each parser constructs a default CSVBackend at
+    ``base_dir`` (preserving direct-parser-usage behavior).
+    """
     if "EX" in form_type:
-        #Exhibit filings are parsed
+        # Exhibit filings are parsed
         return None
     elif "13F" in form_type:
-        return Form13FParser(output_dir=f"{base_dir}")
+        return Form13FParser(output_dir=f"{base_dir}", backend=backend)
     elif "NPORT" in form_type:
-        return FormNPORTParser(output_dir=f"{base_dir}")
+        return FormNPORTParser(output_dir=f"{base_dir}", backend=backend)
     elif form_type.upper() == SECTION16_ALIAS or form_type.upper().startswith(SECTION16_BASE_FORMS):
-        return FormSection16Parser(output_dir=f"{base_dir}")
+        return FormSection16Parser(output_dir=f"{base_dir}", backend=backend)
     else:
         return None
 
 
-def process_filings_for_cik(current_cik, downloaded, form_type, base_dir, logger, show_progress=True):
+def _cleanup_raw_files_for_cik(
+    downloaded_df: pd.DataFrame,
+    cik: str,
+    form_type: str,
+    logger: FilingLogger,
+) -> None:
+    """Delete the raw-filing files we just parsed, plus any now-empty parent
+    directories. Called when ``keep_raw_files=False``.
+
+    Logs successes and failures via the provided logger so the caller has an
+    auditable record of what was removed.
+    """
+    if downloaded_df is None or downloaded_df.empty or "raw_path" not in downloaded_df.columns:
+        return
+
+    valid_raw_paths = downloaded_df["raw_path"].dropna()
+    logger.log_operation(
+        cik=cik,
+        form_type_processed=form_type,
+        operation_type="RAW_FILE_DELETION_START",
+        download_success=True,
+        parse_success=None,
+        download_error_message=(
+            f"Attempting to delete {len(valid_raw_paths)} raw files for CIK {cik}, Form {form_type}."
+        ),
+    )
+
+    deleted_count = 0
+    failed_count = 0
+    for raw_file_path in valid_raw_paths:
+        try:
+            if os.path.exists(raw_file_path):
+                os.remove(raw_file_path)
+                deleted_count += 1
+        except OSError as e_del:
+            failed_count += 1
+            logger.log_operation(
+                cik=cik,
+                form_type_processed=form_type,
+                operation_type="RAW_FILE_DELETION_ERROR",
+                download_success=True,
+                parse_success=False,
+                download_error_message=f"Failed to delete raw file {raw_file_path}: {e_del}",
+            )
+
+    logger.log_operation(
+        cik=cik,
+        form_type_processed=form_type,
+        operation_type="RAW_FILE_DELETION_COMPLETE",
+        download_success=True,
+        parse_success=failed_count == 0,
+        download_error_message=(
+            f"Deleted {deleted_count} raw files. Failed to delete {failed_count} "
+            f"files for CIK {cik}, Form {form_type}."
+        ),
+    )
+
+    # Try to remove now-empty parent directories. We derive the candidate
+    # directories from the first raw path; layout depends on whether the form
+    # is an amendment (/A) and whether it is 13F (identifier dir).
+    if valid_raw_paths.empty:
+        return
+
+    first_raw = Path(valid_raw_paths.iloc[0])
+    actual_file_parent = first_raw.parent
+    form_dir = actual_file_parent.parent if form_type.endswith("/A") else actual_file_parent
+    primary_id_dir = form_dir.parent
+
+    candidates: List[Path] = []
+    if form_type.endswith("/A"):
+        candidates.append(actual_file_parent)
+    candidates.extend([form_dir, primary_id_dir])
+
+    for dir_path in candidates:
+        if not dir_path.exists():
+            continue
+        try:
+            if not os.listdir(dir_path):
+                os.rmdir(dir_path)
+                logger.log_operation(
+                    cik=cik,
+                    form_type_processed=form_type,
+                    operation_type="DIR_DELETION_SUCCESS",
+                    download_error_message=f"Successfully deleted empty directory: {dir_path}",
+                )
+        except OSError as e_rm_dir:
+            logger.log_operation(
+                cik=cik,
+                form_type_processed=form_type,
+                operation_type="DIR_DELETION_ERROR",
+                download_error_message=(
+                    f"Error deleting directory {dir_path} (not empty or other issue): {e_rm_dir}"
+                ),
+            )
+
+
+def _build_raw_index(raw_root: Path) -> dict:
+    """One-shot scan: map accession number → first raw-filing path on disk.
+
+    `_save_raw_filing` writes every filing at ``<root>/.../<accession>/<name>.txt``
+    (the parent directory name is always the accession). We walk ``raw_root``
+    once with ``rglob("*.txt")`` and group by parent name. The cache
+    subdirectory (``<root>/cache/``) is excluded.
+
+    Returns ``{}`` when ``raw_root`` doesn't exist or is empty.
+    """
+    raw_root = Path(raw_root)
+    if not raw_root.exists():
+        return {}
+    index: dict = {}
+    cache_dir = raw_root / "cache"
+    for path in raw_root.rglob("*.txt"):
+        # Skip anything under the form.idx cache dir.
+        try:
+            path.relative_to(cache_dir)
+            continue
+        except ValueError:
+            # Not under cache_dir — this is a real filing path, keep processing.
+            pass
+        accession = path.parent.name
+        # Sanity: accession numbers look like ``NNNNNNNNNN-YY-NNNNNN``.
+        # Don't let top-level directories pollute the index.
+        if not re.match(r"^\d{10}-\d{2}-\d{6}$", accession):
+            continue
+        # First path wins; duplicate-accession writes are rare and not harmful.
+        index.setdefault(accession, str(path))
+    return index
+
+
+def process_filings_for_cik(
+    current_cik,
+    downloaded,
+    form_type,
+    base_dir,
+    logger,
+    show_progress=True,
+    backend: Optional[StorageBackend] = None,
+    known_accessions: Optional[set] = None,
+):
     """
     Process filings for a specific CIK with the restructured parsers.
+
+    ``known_accessions`` (optional) is the set of accession numbers already
+    present in the storage backend. Filings whose accession is in this set
+    are skipped — no re-parse, no re-upsert. Supplied by ``get_filings``
+    when ``resume=True``.
     """
+    known_accessions = known_accessions or set()
     # Determine the identifier to use in log messages (IRS_NUMBER or SEC_FILE_NUMBER if available)
-    identifier_for_log = current_cik # Default to CIK
+    identifier_for_log = current_cik  # Default to CIK
     if downloaded is not None and not downloaded.empty:
         # Attempt to get IRS_NUMBER or SEC_FILE_NUMBER from the first downloaded filing
         # This assumes these might be present after downloader enrichment or initial parsing
         # For simplicity, we check the first entry. A more robust way might involve looking across all entries.
         first_filing_data = downloaded.iloc[0]
-        if pd.notna(first_filing_data.get('IRS_NUMBER')):
-            identifier_for_log = first_filing_data.get('IRS_NUMBER')
-        elif pd.notna(first_filing_data.get('SEC_FILE_NUMBER')):
-            identifier_for_log = first_filing_data.get('SEC_FILE_NUMBER')
+        if pd.notna(first_filing_data.get("IRS_NUMBER")):
+            identifier_for_log = first_filing_data.get("IRS_NUMBER")
+        elif pd.notna(first_filing_data.get("SEC_FILE_NUMBER")):
+            identifier_for_log = first_filing_data.get("SEC_FILE_NUMBER")
 
     logger.log_operation(
-        operation_type="PROCESS_FILINGS_FOR_IDENTIFIER_START", # Changed from CIK
-        cik=current_cik, # Keep original CIK for backend logging if needed
-        custom_identifier=identifier_for_log, # Add the new identifier
+        operation_type="PROCESS_FILINGS_FOR_IDENTIFIER_START",  # Changed from CIK
+        cik=current_cik,  # Keep original CIK for backend logging if needed
+        custom_identifier=identifier_for_log,  # Add the new identifier
         form_type_processed=form_type,
-        download_error_message=f"Starting processing for {identifier_for_log}, Form {form_type}. Downloaded count: {len(downloaded) if downloaded is not None else 0}"
+        download_error_message=f"Starting processing for {identifier_for_log}, Form {form_type}. Downloaded count: {len(downloaded) if downloaded is not None else 0}",
     )
 
     # Get parser for the form type
-    parser = get_parser_for_form_type_internal(form_type, str(base_dir))
+    parser = get_parser_for_form_type_internal(form_type, str(base_dir), backend=backend)
     if parser is None:
         logger.log_operation(
             cik=current_cik,
-            operation_type="PARSER_LOOKUP", 
-            download_success=True, 
-            parse_success=False, 
-            download_error_message=f"No parser available or needed for form type {form_type}. Skipping parsing."
+            operation_type="PARSER_LOOKUP",
+            download_success=True,
+            parse_success=False,
+            download_error_message=f"No parser available or needed for form type {form_type}. Skipping parsing.",
         )
         return downloaded["raw_path"].tolist(), {}, downloaded
-    
+
     # Determine parser_operation_type for logging, MUST be after parser is confirmed not None
     parser_operation_type = f"PARSER-{form_type.upper().replace('-', '_')}"
 
     # Filter valid filings (remove NaN paths)
     total_filings = len(downloaded)
-    valid_filings = downloaded.dropna(subset=['raw_path'])
+    valid_filings = downloaded.dropna(subset=["raw_path"])
     remaining_filings = len(valid_filings)
     skipped_filings = total_filings - remaining_filings
-    
+
     if skipped_filings > 0:
         logger.log_operation(
             cik=current_cik,
-            accession_number=None, # This log is not per-accession
-            operation_type="PARSER_INPUT_FILTER", # More generic type for pre-parsing step
-            download_success=True, # This indicates the inputs to parsing might be problematic, not download itself
-            download_error_message=f"Skipped {skipped_filings} filings (missing file paths). Proceeding with {remaining_filings} valid filings."
+            accession_number=None,  # This log is not per-accession
+            operation_type="PARSER_INPUT_FILTER",  # More generic type for pre-parsing step
+            download_success=True,  # This indicates the inputs to parsing might be problematic, not download itself
+            download_error_message=f"Skipped {skipped_filings} filings (missing file paths). Proceeding with {remaining_filings} valid filings.",
         )
-        
+
     # Process filings with progress bar
     parsed_files = {}
-    filing_iterator = tqdm(
-        valid_filings.iterrows(),
-        desc=f"Parsing {form_type} filings for {identifier_for_log}", # Changed from CIK
-        total=remaining_filings,
-        disable=not show_progress
-    ) if show_progress else valid_filings.iterrows()
-    
+    filing_iterator = (
+        tqdm(
+            valid_filings.iterrows(),
+            desc=f"Parsing {form_type} filings for {identifier_for_log}",  # Changed from CIK
+            total=remaining_filings,
+            disable=not show_progress,
+        )
+        if show_progress
+        else valid_filings.iterrows()
+    )
+
     successful_parses = 0
     total_holdings_extracted = 0
-    
+
     for _, filing in filing_iterator:
         try:
             cik = filing["cik"]
             raw_path = filing["raw_path"]
             accession_number = filing["accession_number"]
-            
-            if not os.path.exists(raw_path):
-                logger.log_operation(
-                    cik=current_cik,
-                    accession_number=accession_number,
-                    operation_type=parser_operation_type,
-                    download_success=True, 
-                    parse_success=False,
-                    download_error_message=f"Raw file not found at {raw_path}"
-                )
+
+            # Resume short-circuit: already in the storage backend → skip
+            # re-parse entirely. The downloader already logged the Level-A
+            # skip; no need to double-log here.
+            if accession_number in known_accessions:
                 continue
-            
-            # Read and validate filing content
-            with open(raw_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Quick validation
-            validation = validate_filing_content(content)
-            if not validation['is_valid_sec_filing']:
+
+            if not raw_path or not os.path.exists(raw_path):
                 logger.log_operation(
                     cik=current_cik,
                     accession_number=accession_number,
                     operation_type=parser_operation_type,
                     download_success=True,
                     parse_success=False,
-                    download_error_message="Invalid SEC filing format"
+                    download_error_message=f"Raw file not found at {raw_path}",
                 )
                 continue
-            
+
+            # Read and validate filing content
+            with open(raw_path, encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+
+            # Quick validation
+            validation = validate_filing_content(content)
+            if not validation["is_valid_sec_filing"]:
+                logger.log_operation(
+                    cik=current_cik,
+                    accession_number=accession_number,
+                    operation_type=parser_operation_type,
+                    download_success=True,
+                    parse_success=False,
+                    download_error_message="Invalid SEC filing format",
+                )
+                continue
+
             # Parse the filing using the new parser structure
             parsed_data = parser.parse_filing(content)
             filing_url = filing.get("url")
-            if 'filing_info' in parsed_data and not parsed_data['filing_info'].empty:
-                filing_info_df = parsed_data['filing_info'].copy()
-                if 'SEC_FILING_URL' not in filing_info_df.columns:
-                    filing_info_df['SEC_FILING_URL'] = pd.NA
-                filing_info_df['SEC_FILING_URL'] = filing_info_df['SEC_FILING_URL'].astype('object')
-                filing_info_df.loc[:, 'SEC_FILING_URL'] = filing_url if filing_url else pd.NA
-                parsed_data['filing_info'] = filing_info_df
-            
+            if "filing_info" in parsed_data and not parsed_data["filing_info"].empty:
+                filing_info_df = parsed_data["filing_info"].copy()
+                if "SEC_FILING_URL" not in filing_info_df.columns:
+                    filing_info_df["SEC_FILING_URL"] = pd.NA
+                filing_info_df["SEC_FILING_URL"] = filing_info_df["SEC_FILING_URL"].astype("object")
+                filing_info_df.loc[:, "SEC_FILING_URL"] = filing_url if filing_url else pd.NA
+                parsed_data["filing_info"] = filing_info_df
+
             # Save parsed data according to parser type
             if isinstance(parser, Form13FParser):
                 form_13f_file_number_for_saving = "unknown_file_number"
-                if 'filing_info' in parsed_data and not parsed_data['filing_info'].empty:
-                    filing_info_df = parsed_data['filing_info']
-                    if 'FORM_13F_FILE_NUMBER' in filing_info_df.columns:
-                        val = filing_info_df['FORM_13F_FILE_NUMBER'].iloc[0]
+                if "filing_info" in parsed_data and not parsed_data["filing_info"].empty:
+                    filing_info_df = parsed_data["filing_info"]
+                    if "FORM_13F_FILE_NUMBER" in filing_info_df.columns:
+                        val = filing_info_df["FORM_13F_FILE_NUMBER"].iloc[0]
                         if pd.notna(val):
                             form_13f_file_number_for_saving = str(val)
                 parser.save_parsed_data(parsed_data, form_13f_file_number_for_saving, cik)
-            elif isinstance(parser, FormNPORTParser):
-                parser.save_parsed_data(parsed_data)
-            elif isinstance(parser, FormSection16Parser):
+            elif isinstance(parser, (FormNPORTParser, FormSection16Parser)):
                 parser.save_parsed_data(parsed_data)
             else:
                 # Fallback or error for unknown parser types, though get_parser_for_form_type_internal should prevent this.
                 logger.log_operation(
                     cik=current_cik,
-                    accession_number=accession_number, # Accession still available here from the loop
+                    accession_number=accession_number,  # Accession still available here from the loop
                     operation_type="SAVE_PARSED_DATA_ERROR",
-                    download_success=True, 
-                    parse_success=True, # Assuming parse was ok, but save failed due to parser type
-                    download_error_message=f"Cannot save data: Unknown parser type {type(parser).__name__}"
+                    download_success=True,
+                    parse_success=True,  # Assuming parse was ok, but save failed due to parser type
+                    download_error_message=f"Cannot save data: Unknown parser type {type(parser).__name__}",
                 )
-            
+
             # Track parsing results
-            holdings_count = len(parsed_data['holdings'])
-            
+            holdings_count = len(parsed_data["holdings"])
+
             company_data_found = False
             # Check the type of parser to determine how to find company data
             if isinstance(parser, FormNPORTParser):
-                if 'filing_info' in parsed_data and not parsed_data['filing_info'].empty:
+                if "filing_info" in parsed_data and not parsed_data["filing_info"].empty:
                     # For NPORT, company info is part of filing_info.
                     # Check if 'COMPANY_NAME' column exists and has non-null values.
-                    company_data_found = 'COMPANY_NAME' in parsed_data['filing_info'].columns and \
-                                         not parsed_data['filing_info']['COMPANY_NAME'].dropna().empty
-            elif 'company' in parsed_data: # Retain existing logic for other parsers (e.g., Form13FParser)
-                 company_data_found = not parsed_data['company'].empty
+                    company_data_found = (
+                        "COMPANY_NAME" in parsed_data["filing_info"].columns
+                        and not parsed_data["filing_info"]["COMPANY_NAME"].dropna().empty
+                    )
+            elif "company" in parsed_data:  # Retain existing logic for other parsers (e.g., Form13FParser)
+                company_data_found = not parsed_data["company"].empty
 
             parsed_files[accession_number] = {
-                'company_data_found': company_data_found,
-                'filing_info_found': 'filing_info' in parsed_data and not parsed_data['filing_info'].empty,
-                'holdings_count': holdings_count,
-                'file_size_kb': len(content) // 1024,
-                'form_type_detected': validation.get('form_type', form_type)
+                "company_data_found": company_data_found,
+                "filing_info_found": "filing_info" in parsed_data and not parsed_data["filing_info"].empty,
+                "holdings_count": holdings_count,
+                "file_size_kb": len(content) // 1024,
+                "form_type_detected": validation.get("form_type", form_type),
             }
-            
+
             successful_parses += 1
             total_holdings_extracted += holdings_count
-            
+
             # Log successful parse
             logger.log_operation(
                 cik=current_cik,
                 accession_number=accession_number,
                 operation_type=parser_operation_type,
-                download_success=True, 
+                download_success=True,
                 parse_success=True,
-                download_error_message=f"Successfully parsed {holdings_count:,} holdings"
+                download_error_message=f"Successfully parsed {holdings_count:,} holdings",
             )
-            
+
         except Exception as e:
+            status_code = None
+            if isinstance(e, requests.RequestException):
+                response = getattr(e, "response", None)
+                status_code = getattr(response, "status_code", None)
             logger.log_operation(
                 cik=current_cik,
                 accession_number=filing.get("accession_number", "unknown"),
                 operation_type=parser_operation_type,
-                download_success=True, 
+                download_success=True,
                 parse_success=False,
                 download_error_message=f"Parse error: {str(e)}",
-                error_code=getattr(e, 'response', {}).get('status_code', None) if isinstance(e, requests.RequestException) else None
+                error_code=status_code,
             )
-    
+
     logger.log_operation(
-        operation_type="PROCESS_FILINGS_FOR_IDENTIFIER_END", # Changed from CIK
-        cik=current_cik, # Keep original CIK
+        operation_type="PROCESS_FILINGS_FOR_IDENTIFIER_END",  # Changed from CIK
+        cik=current_cik,  # Keep original CIK
         custom_identifier=identifier_for_log,
         form_type_processed=form_type,
-        download_error_message=f"Finished processing for {identifier_for_log}, Form {form_type}. Successful parses: {successful_parses}, Holdings: {total_holdings_extracted}"
+        download_error_message=f"Finished processing for {identifier_for_log}, Form {form_type}. Successful parses: {successful_parses}, Holdings: {total_holdings_extracted}",
     )
     return downloaded["raw_path"].tolist(), parsed_files, downloaded
 
@@ -251,7 +414,7 @@ def get_filings(
     user_name: str,
     user_agent_email: str,
     cik: Union[str, List[str], None] = None,
-    form_type: Union[str, List[str]] = '13F-HR',
+    form_type: Union[str, List[str]] = "13F-HR",
     start_year: int = None,
     end_year: Optional[int] = None,
     base_dir: Optional[str] = None,
@@ -259,11 +422,13 @@ def get_filings(
     raw_data_dir: Optional[str] = None,
     show_progress: bool = True,
     max_workers: int = 5,
-    keep_raw_files: bool = True
+    keep_raw_files: bool = True,
+    export_format: str = "duckdb",
+    resume: bool = True,
 ) -> None:
     """
     Download and parse SEC filings for one or more companies and form types.
-    
+
     Args:
         user_name: Name of the user or organization (required for User-Agent)
         user_agent_email: Email address for SEC's fair access rules (required for User-Agent)
@@ -277,38 +442,55 @@ def get_filings(
         show_progress: Whether to show progress bars (defaults to True)
         max_workers: Maximum number of parallel download workers (defaults to 5)
         keep_raw_files: If False, raw filing files will be deleted after processing for each CIK. Defaults to True (files are kept).
+        export_format: Output backend for parsed data. "duckdb" (default) writes to a single
+            ``piboufilings.duckdb`` file under ``base_dir`` with one table per dataset and
+            PK-based dedup. "csv" keeps the legacy period-partitioned CSVs. DuckDB requires
+            ``pip install piboufilings[duckdb]``.
+        resume: If True (default), skip any filing whose accession number is already in the
+            storage backend (Level A: no download + no parse) or already on disk via
+            ``raw_data_dir`` (Level B: no download, re-parse). Pass False to force a full
+            refetch and re-parse, e.g. after a schema change. Note: switching
+            ``export_format`` between runs makes the new backend see no prior state —
+            Level B on-disk reuse still applies if ``keep_raw_files=True``.
     """
-    
-    
+
     ### VALIDATE INPUTS ###
     if start_year is None:
         start_year = datetime.today().year
-        
+
     if end_year is None:
         end_year = start_year
-        
+
     # Resolve directories with env-aware defaults
     base_dir, log_dir_path, raw_data_dir_path = resolve_io_paths(
-        base_dir=base_dir,
-        log_dir=log_dir,
-        raw_data_dir=raw_data_dir,
-        default_base=Path.cwd() / "data_parsed"
+        base_dir=base_dir, log_dir=log_dir, raw_data_dir=raw_data_dir, default_base=Path.cwd() / "data_parsed"
     )
-    
+
     # Initialize downloader and logger
     downloader = SECDownloader(
-        user_name=user_name, 
-        user_agent_email=user_agent_email, 
+        user_name=user_name,
+        user_agent_email=user_agent_email,
         package_version=package_version,
-        log_dir=log_dir_path, 
+        log_dir=log_dir_path,
         max_workers=max_workers,
-        data_dir=raw_data_dir_path
+        data_dir=raw_data_dir_path,
     )
     logger = FilingLogger(log_dir=log_dir_path)
 
+    # Single shared storage backend for all parsers in this run.
+    try:
+        backend = get_backend(export_format, base_dir)
+    except ImportError as e:
+        logger.log_operation(
+            operation_type="BACKEND_INIT_FAIL",
+            download_success=False,
+            download_error_message=f"Storage backend init failed: {e}",
+        )
+        raise
+
     logger.log_operation(
         operation_type="GET_FILINGS_START",
-        download_error_message=f"Starting get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}"
+        download_error_message=f"Starting get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}, Export: {export_format}",
     )
 
     # Determine the list of form types to process
@@ -325,10 +507,9 @@ def get_filings(
             cik=None,
             download_success=False,
             parse_success=False,
-            download_error_message="Invalid form_type provided; defaulting to '13F-HR'."
+            download_error_message="Invalid form_type provided; defaulting to '13F-HR'.",
         )
-        form_type_list = ['13F-HR']
-
+        form_type_list = ["13F-HR"]
 
     ### GET ALL FILING FOR SPECIC DATE RANGE ###
     # Get index data once for all specified years
@@ -337,10 +518,7 @@ def get_filings(
         form_filters_for_index = [_normalize_form_type(ft) for ft in form_filters_for_index]
 
     full_index_data_for_years = downloader.get_sec_index_data(
-        start_year,
-        end_year,
-        form_filters=form_filters_for_index,
-        cik_filters=cik_filters_for_index
+        start_year, end_year, form_filters=form_filters_for_index, cik_filters=cik_filters_for_index
     )
 
     if full_index_data_for_years.empty:
@@ -349,21 +527,39 @@ def get_filings(
             cik=None,
             download_success=False,
             parse_success=False,
-            download_error_message=f"No index data found for years {start_year}-{end_year}. Cannot proceed."
+            download_error_message=f"No index data found for years {start_year}-{end_year}. Cannot proceed.",
         )
         return
+
+    # Build the raw-on-disk index once per call when resuming; reused across forms.
+    # Skipped when resume=False to preserve the pre-0.6 "always refetch" semantics.
+    raw_index = _build_raw_index(raw_data_dir_path) if resume else {}
 
     # Process each form type from the list
     for current_form_str in form_type_list:
         normalized_form_for_download = _normalize_form_type(current_form_str)
         is_section16_alias = current_form_str.upper() == SECTION16_ALIAS
 
+        # Per-form known-accessions snapshot. Built once per form (not per CIK)
+        # to minimize backend queries.
+        known_accessions: set = backend.known_accessions(current_form_str) if resume else set()
+        logger.log_operation(
+            operation_type="RESUME_KNOWN_ACCESSIONS",
+            form_type_processed=current_form_str,
+            download_success=True,
+            level="INFO",
+            download_error_message=(
+                f"resume={resume}; known accessions in backend: {len(known_accessions)}; "
+                f"raw files on disk index: {len(raw_index)}"
+            ),
+        )
+
         logger.log_operation(
             operation_type="FORM_TYPE_PROCESSING_START",
             cik=None,
             download_success=True,
             parse_success=None,
-            download_error_message=f"Processing form type: {current_form_str}"
+            download_error_message=f"Processing form type: {current_form_str}",
         )
 
         # Filter index data for the current form type
@@ -385,14 +581,13 @@ def get_filings(
                 form_type_processed=current_form_str,
                 download_success=False,
                 parse_success=False,
-                download_error_message=f"No index entries found for form type {current_form_str} from years {start_year}-{end_year}"
+                download_error_message=f"No index entries found for form type {current_form_str} from years {start_year}-{end_year}",
             )
-            continue # Move to the next form type in the list
+            continue  # Move to the next form type in the list
 
         # Normalize CIKs for the current form's filtered index data
-        index_data_for_current_form = index_data_for_current_form.copy() # Avoid SettingWithCopyWarning
+        index_data_for_current_form = index_data_for_current_form.copy()  # Avoid SettingWithCopyWarning
         index_data_for_current_form.loc[:, "CIK"] = index_data_for_current_form["CIK"].astype(str)
-
 
         ### EXTRACT UNIQUE CIKS FROM FILTERED INDEX DATA FOR THE CURRENT FORM TYPE ###
         available_ciks_for_form = index_data_for_current_form["CIK"].unique().tolist()
@@ -401,30 +596,30 @@ def get_filings(
             operation_type="CIK_IDENTIFICATION",
             download_success=True,
             parse_success=None,
-            download_error_message=f"Found {len(available_ciks_for_form)} CIKs for form type {current_form_str} from years {start_year}-{end_year}"
+            download_error_message=f"Found {len(available_ciks_for_form)} CIKs for form type {current_form_str} from years {start_year}-{end_year}",
         )
 
         ciks_to_process_for_current_form: List[str]
-        if cik is not None: # User has specified CIK(s)
+        if cik is not None:  # User has specified CIK(s)
             user_ciks_input_list: List[str]
             if isinstance(cik, str):
                 user_ciks_input_list = [str(cik).zfill(10)]
             elif isinstance(cik, list):
                 user_ciks_input_list = [str(c).zfill(10) for c in cik]
-            else: 
+            else:
                 logger.log_operation(
                     operation_type="INPUT_VALIDATION_ERROR",
                     cik=None,
                     download_success=False,
                     parse_success=False,
-                    download_error_message="Invalid CIK input type."
+                    download_error_message="Invalid CIK input type.",
                 )
-                continue 
+                continue
 
             ciks_to_process_for_current_form = [
                 c_val for c_val in user_ciks_input_list if c_val in available_ciks_for_form
             ]
-            
+
             if not ciks_to_process_for_current_form:
                 logger.log_operation(
                     operation_type="CIK_FILTER_NO_MATCH",
@@ -432,10 +627,10 @@ def get_filings(
                     form_type_processed=current_form_str,
                     download_success=False,
                     parse_success=False,
-                    download_error_message=f"None of the provided CIK(s) filed form type {current_form_str} in the specified date range."
+                    download_error_message=f"None of the provided CIK(s) filed form type {current_form_str} in the specified date range.",
                 )
-                continue 
-        else: 
+                continue
+        else:
             ciks_to_process_for_current_form = available_ciks_for_form
 
         if not ciks_to_process_for_current_form:
@@ -444,20 +639,20 @@ def get_filings(
                 form_type_processed=current_form_str,
                 download_success=False,
                 parse_success=False,
-                download_error_message=f"No CIKs to process for form type {current_form_str}."
+                download_error_message=f"No CIKs to process for form type {current_form_str}.",
             )
-            continue 
+            continue
 
-        all_raw_files_for_cik_form = {} 
-        all_parsed_files_for_cik_form = {}
-        all_metadata_for_cik_form = {}
-    
-        cik_iterator = tqdm(
-            ciks_to_process_for_current_form, 
-            desc=f"Processing firms with {current_form_str} filings", 
-            disable=not show_progress
-        ) if show_progress else ciks_to_process_for_current_form
-    
+        cik_iterator = (
+            tqdm(
+                ciks_to_process_for_current_form,
+                desc=f"Processing firms with {current_form_str} filings",
+                disable=not show_progress,
+            )
+            if show_progress
+            else ciks_to_process_for_current_form
+        )
+
         for current_cik_str in cik_iterator:
             try:
                 # Further filter the index_data_for_current_form for the specific CIK.
@@ -476,23 +671,21 @@ def get_filings(
                         form_type_processed=current_form_str,
                         download_success=False,
                         parse_success=False,
-                        download_error_message=f"No specific index entries found for CIK {current_cik_str} and form {current_form_str} before download call."
+                        download_error_message=f"No specific index entries found for CIK {current_cik_str} and form {current_form_str} before download call.",
                     )
-                    # Ensure keys exist even if empty, then continue to next CIK
-                    all_raw_files_for_cik_form[current_cik_str] = []
-                    all_parsed_files_for_cik_form[current_cik_str] = {}
-                    all_metadata_for_cik_form[current_cik_str] = pd.DataFrame()
                     continue
 
                 downloaded_df = downloader.download_filings(
                     cik=current_cik_str,
                     form_type=normalized_form_for_download,
-                    start_year=start_year, # Still needed for fallback if index_data_subset is empty
-                    end_year=end_year,   # Still needed for fallback
-                    show_progress=False, 
-                    index_data_subset=company_filings_to_download # Pass the pre-filtered subset
+                    start_year=start_year,  # Still needed for fallback if index_data_subset is empty
+                    end_year=end_year,  # Still needed for fallback
+                    show_progress=False,
+                    index_data_subset=company_filings_to_download,  # Pass the pre-filtered subset
+                    known_accessions=known_accessions,
+                    raw_index=raw_index,
                 )
-            
+
                 if downloaded_df.empty:
                     logger.log_operation(
                         cik=current_cik_str,
@@ -500,37 +693,27 @@ def get_filings(
                         form_type_processed=current_form_str,
                         download_success=False,
                         parse_success=False,
-                        download_error_message=f"No filings found for CIK {current_cik_str}, form {current_form_str}"
+                        download_error_message=f"No filings found for CIK {current_cik_str}, form {current_form_str}",
                     )
-                    # Ensure keys exist even if empty
-                    all_raw_files_for_cik_form[current_cik_str] = []
-                    all_parsed_files_for_cik_form[current_cik_str] = {}
-                    all_metadata_for_cik_form[current_cik_str] = pd.DataFrame()
-                    continue # Next CIK
-            
-                # Process downloaded filings using the unified approach
-                parser_specific_handling = False
-                if (
-                    any(substring in current_form_str.upper() for substring in ["13F", "NPORT"])
+                    continue  # Next CIK
+
+                # Dispatch supported forms to their parsers; log + skip others.
+                is_supported_form = (
+                    any(sub in current_form_str.upper() for sub in ["13F", "NPORT"])
                     or current_form_str.upper() == SECTION16_ALIAS
                     or str(current_form_str).startswith(SECTION16_BASE_FORMS)
-                ):
-                    parser_specific_handling = True
-                
-                if parser_specific_handling:
-                    raw_files, parsed_files_data, metadata_df = process_filings_for_cik(
+                )
+                if is_supported_form:
+                    process_filings_for_cik(
                         current_cik=current_cik_str,
                         downloaded=downloaded_df,
-                        form_type=current_form_str, 
+                        form_type=current_form_str,
                         base_dir=base_dir,
                         logger=logger,
-                        show_progress=False 
+                        show_progress=False,
+                        backend=backend,
+                        known_accessions=known_accessions,
                     )
-                
-                    all_raw_files_for_cik_form[current_cik_str] = raw_files
-                    all_parsed_files_for_cik_form[current_cik_str] = parsed_files_data
-                    all_metadata_for_cik_form[current_cik_str] = metadata_df
-                
                 else:
                     logger.log_operation(
                         cik=current_cik_str,
@@ -538,119 +721,52 @@ def get_filings(
                         form_type_processed=current_form_str,
                         download_success=True,
                         parse_success=False,
-                        download_error_message=f"Form type '{current_form_str}' not specifically supported for parsing; storing raw files."
+                        download_error_message=f"Form type '{current_form_str}' not specifically supported for parsing; storing raw files.",
                     )
-                    all_raw_files_for_cik_form[current_cik_str] = downloaded_df["raw_path"].tolist()
-                    all_parsed_files_for_cik_form[current_cik_str] = {} 
-                    all_metadata_for_cik_form[current_cik_str] = downloaded_df 
-            
+
                 # After processing (parsing or storing raw) for the current CIK and form type
-                if not keep_raw_files and not downloaded_df.empty and 'raw_path' in downloaded_df.columns:
-                    logger.log_operation(
+                if not keep_raw_files:
+                    _cleanup_raw_files_for_cik(
+                        downloaded_df=downloaded_df,
                         cik=current_cik_str,
-                        form_type_processed=current_form_str,
-                        operation_type="RAW_FILE_DELETION_START",
-                        download_success=True, 
-                        parse_success=None, 
-                        download_error_message=f"Attempting to delete {len(downloaded_df['raw_path'].dropna())} raw files for CIK {current_cik_str}, Form {current_form_str}."
+                        form_type=current_form_str,
+                        logger=logger,
                     )
-                    deleted_count = 0
-                    failed_count = 0
-                    for raw_file_path in downloaded_df["raw_path"].dropna():
-                        try:
-                            if os.path.exists(raw_file_path):
-                                os.remove(raw_file_path)
-                                deleted_count += 1
-                        except Exception as e_del:
-                            failed_count += 1
-                            logger.log_operation(
-                                cik=current_cik_str,
-                                form_type_processed=current_form_str,
-                                operation_type="RAW_FILE_DELETION_ERROR",
-                                download_success=True,
-                                parse_success=False,
-                                download_error_message=f"Failed to delete raw file {raw_file_path}: {str(e_del)}"
-                            )
-                    logger.log_operation(
-                        cik=current_cik_str,
-                        form_type_processed=current_form_str,
-                        operation_type="RAW_FILE_DELETION_COMPLETE",
-                        download_success=True,
-                        parse_success=True if failed_count == 0 else False,
-                        download_error_message=f"Deleted {deleted_count} raw files. Failed to delete {failed_count} files for CIK {current_cik_str}, Form {current_form_str}."
-                    )
-
-                    # Determine directory paths for deletion based on actual raw_file_path structure
-                    # This handles both CIK-based and FORM_13F_FILE_NUMBER-based paths.
-                    dir_to_try_removing = []
-                    valid_raw_paths = downloaded_df["raw_path"].dropna()
-                    if not valid_raw_paths.empty:
-                        first_raw_file_path = Path(valid_raw_paths.iloc[0])
-                        
-                        # Level 1: Directory containing the actual file (e.g., .../13F-HR/A/ or .../13F-HR/)
-                        actual_file_parent_dir = first_raw_file_path.parent
-
-                        # Level 2: Form type directory (e.g., .../13F-HR/)
-                        form_type_level_dir = actual_file_parent_dir
-                        if current_form_str.endswith("/A"):
-                            form_type_level_dir = actual_file_parent_dir.parent # Move up if it was an amendment subdir
-                        
-                        # Level 3: Primary identifier directory (e.g., .../CIK/ or .../FORM_13F_FILE_NUMBER/)
-                        # This is the parent of the form_type_level_dir
-                        primary_id_level_dir = form_type_level_dir.parent
-
-                        # Order for deletion: innermost to outermost
-                        if current_form_str.endswith("/A"):
-                            dir_to_try_removing.append(actual_file_parent_dir) # e.g., .../13F-HR/A (actual_file_parent_dir)
-                        dir_to_try_removing.append(form_type_level_dir)    # e.g., .../13F-HR (form_type_level_dir)
-                        dir_to_try_removing.append(primary_id_level_dir)   # e.g., .../CIK_or_S000XXXX (primary_id_level_dir)
-                    
-                    # Original loop for deleting directories is kept, but uses the new dir_to_try_removing list
-                    for dir_path in dir_to_try_removing:
-                        if dir_path.exists(): # Check if path derived exists
-                            try:
-                                if not os.listdir(dir_path): # Check if empty
-                                    os.rmdir(dir_path)
-                                    logger.log_operation(
-                                        cik=current_cik_str,
-                                        form_type_processed=current_form_str, # Context for which operation led to this cleanup
-                                        operation_type="DIR_DELETION_SUCCESS",
-                                        download_error_message=f"Successfully deleted empty directory: {str(dir_path)}"
-                                    )
-                                # If not empty, os.rmdir would fail, so we don't need an explicit else log here for "not empty"
-                            except OSError as e_rm_dir:
-                                logger.log_operation(
-                                    cik=current_cik_str,
-                                    form_type_processed=current_form_str,
-                                    operation_type="DIR_DELETION_ERROR",
-                                    download_error_message=f"Error deleting directory {str(dir_path)} (it might not be empty or other issue): {str(e_rm_dir)}"
-                                )
-                        # If dir_path doesn't exist (e.g., already removed in a previous step), do nothing
+                    # If dir_path doesn't exist (e.g., already removed in a previous step), do nothing
 
             except Exception as e:
                 logger.log_operation(
                     cik=current_cik_str,
                     operation_type="CIK_PROCESSING_ERROR",
                     form_type_processed=current_form_str,
-                    download_success=False, 
+                    download_success=False,
                     parse_success=False,
-                    download_error_message=f"Processing error for CIK {current_cik_str}, Form {current_form_str}: {str(e)}"
+                    download_error_message=f"Processing error for CIK {current_cik_str}, Form {current_form_str}: {str(e)}",
                 )
-                all_raw_files_for_cik_form[current_cik_str] = []
-                all_parsed_files_for_cik_form[current_cik_str] = {}
-                all_metadata_for_cik_form[current_cik_str] = pd.DataFrame()
+
+    try:
+        backend.close()
+    except Exception as e_close:
+        logger.log_operation(
+            operation_type="BACKEND_CLOSE_ERROR",
+            download_error_message=f"Error closing storage backend: {e_close}",
+        )
 
     logger.log_operation(
         operation_type="GET_FILINGS_END",
-        download_error_message=f"Finished get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}"
+        download_error_message=f"Finished get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}",
     )
 
-__version__ = "0.4.0"
+
 __all__ = [
-    "get_filings", 
-    "SECDownloader", 
-    "FilingLogger", 
+    "__version__",
+    "get_filings",
+    "get_parser_for_form_type_internal",
+    "SECDownloader",
+    "FilingLogger",
     "Form13FParser",
     "FormNPORTParser",
-    "FormSection16Parser"
+    "FormSection16Parser",
+    "StorageBackend",
+    "get_backend",
 ]

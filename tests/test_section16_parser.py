@@ -13,7 +13,6 @@ def test_section16_parser_with_real_filing(tmp_path):
     downloader = SECDownloader(
         user_name="Test Runner",
         user_agent_email="test@example.com",
-        package_version="0.4.0",
         log_dir=tmp_path / "logs",
         max_workers=1,
         data_dir=tmp_path / "data_raw" / "test_raw",
@@ -36,7 +35,7 @@ def test_section16_parser_with_real_filing(tmp_path):
     raw_path = downloaded.iloc[0]["raw_path"]
     assert raw_path and raw_path.strip()
 
-    with open(raw_path, "r", encoding="utf-8", errors="ignore") as f:
+    with open(raw_path, encoding="utf-8", errors="ignore") as f:
         content = f.read()
 
     parser = FormSection16Parser(output_dir=tmp_path / "parsed")
@@ -57,19 +56,17 @@ def test_section16_save_dedup(tmp_path):
             {"ACCESSION_NUMBER": "acc", "DOCUMENT_TYPE": "4", "PERIOD_OF_REPORT": "2023-01-01"},
         ]
     )
-    parsed_data = {
-        "filing_info": sample_rows,
-        "transactions": pd.DataFrame(),
-        "holdings": pd.DataFrame()
-    }
+    parsed_data = {"filing_info": sample_rows, "transactions": pd.DataFrame(), "holdings": pd.DataFrame()}
     parser.save_parsed_data(parsed_data)
     # Append again to exercise deduplication path
     parser.save_parsed_data(parsed_data)
-    saved = pd.read_csv(tmp_path / "sec16_info.csv")
-    assert len(saved) == 2
+    saved = pd.read_csv(tmp_path / "sec16_info_2023_01.csv")
+    # Both incoming rows share the ACCESSION_NUMBER primary key, so the backend
+    # collapses them to a single row and subsequent saves remain idempotent.
+    assert len(saved) == 1
     parser.save_parsed_data(parsed_data)
-    saved_after = pd.read_csv(tmp_path / "sec16_info.csv")
-    assert len(saved_after) == 2
+    saved_after = pd.read_csv(tmp_path / "sec16_info_2023_01.csv")
+    assert len(saved_after) == 1
     assert "PERIOD_OF_REPORT" in saved_after.columns
 
 

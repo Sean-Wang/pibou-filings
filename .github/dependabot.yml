@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # GitHub Actions — keep the CI + publish workflows on supported major
+  # versions without manual chores.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+
+  # Python deps (lower bounds in pyproject.toml). Dependabot will propose
+  # version bumps if security advisories or new majors warrant it.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+    groups:
+      # Bundle patch/minor updates for non-security deps into a single PR.
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

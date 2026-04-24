@@ -20,9 +20,7 @@ wheels/
 .installed.cfg
 *.egg
 
-# Project specific
-data_RAW/
-logs/
+# Environments
 .env
 .venv
 env/
@@ -37,12 +35,22 @@ ENV/
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Project output directories
+logs/
+out/
+data_RAW/
 /data_parse
-/data_parse
-/data_parse
-demo_local.ipynb
 /data_parsed
+/data_raw
+demo_local_logs/
+demo_local_output/
+demo_local_raw/
+demo_local.ipynb
+piboufilings.duckdb
+
+# Legacy local output folders
 /my_sec_data
 /my_sec_logs
 /my_sec_raw_data

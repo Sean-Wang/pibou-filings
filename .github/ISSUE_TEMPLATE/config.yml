@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussion / question
+    url: https://github.com/Pierre-Bouquet/pibou-filings/discussions
+    about: For questions about usage, parsing choices, or schema design, please start a Discussion rather than filing an issue.
