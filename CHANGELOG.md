@@ -38,7 +38,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 - `get_filings(..., resume=True)` is the new default. A second invocation
   with the same arguments will now skip already-processed filings. Pass
-  `resume=False` to restore the 0.5.0 "always refetch" behavior.
+  `resume=False` to restore the pre-0.5.1 "always refetch" behavior.
 
 ### Migration notes
 - **If you rely on 'always refetch' semantics**: pass `resume=False`.
@@ -134,7 +134,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## Migration guide: 0.4.x → 0.5.0
+## Migration guide: 0.4.x → 0.5.1
 
 ### I want my CSV output to keep working
 
@@ -172,7 +172,7 @@ See `README.md` for the dataset → table mapping.
 ### I'm on Python 3.8
 
 Upgrade to 3.9+. Python 3.8 reached end-of-life in October 2024; the 0.5.0
-codebase uses PEP 585 runtime generics that fail on 3.8 anyway.
+changes use PEP 585 runtime generics that fail on 3.8 anyway.
 
 ### I had custom code relying on `SECDownloader(package_version="0.4.0")`
 

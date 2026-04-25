@@ -10,12 +10,13 @@
 
 ---
 
-> **What's new in 0.5.0** — Parsed data now lands in a **DuckDB** file by
-> default (one table per dataset, PK-based dedup, crash-safe). Pass
+> **What's new in 0.5.1** — Parsed data now lands in a **DuckDB** file by
+> default (one table per dataset, PK-based dedup, crash-safe), and interrupted
+> runs now resume safely by default. Pass
 > `export_format="csv"` to keep the legacy period-partitioned CSV files.
 > See [CHANGELOG.md](./CHANGELOG.md) for the full list and migration guide.
 >
-> `0.5.0` is still pre-1.0 (Alpha). The data schemas are stable; the public
+> `0.5.1` is still pre-1.0 (Alpha). The data schemas are stable; the public
 > API may evolve.
 
 ## Filing Contents at a Glance
@@ -475,7 +476,7 @@ the extra (`pip install 'piboufilings[duckdb]'`) or pass
 `export_format="csv"`.
 
 **`ValueError: Unknown export_format 'parquet'`**
-Only `"duckdb"` and `"csv"` are supported in 0.5. File an issue if you'd
+Only `"duckdb"` and `"csv"` are supported in 0.5.1. File an issue if you'd
 like another backend.
 
 **SEC returns `HTTP 429` under high parallelism**
@@ -485,11 +486,11 @@ Retries with exponential backoff are handled automatically.
 
 **Download stalls or my disk fills up**
 The legacy CSV append path was quadratic in existing row count. Upgrade to
-0.5.0 and use the DuckDB backend (the default). See the
+0.5.1 and use the DuckDB backend (the default). See the
 [CHANGELOG](./CHANGELOG.md).
 
 **`FileNotFoundError` on the log directory**
-Fixed in 0.5.0 — `FilingLogger` now creates missing parent directories.
+Fixed in 0.5.1 — `FilingLogger` now creates missing parent directories.
 Older versions required the parent to exist.
 
 **`ConnectionException: Can't open a connection to same database file with a different configuration than existing connections`**
@@ -501,16 +502,16 @@ until the first connection is dropped.
 - In notebooks, open the DB with the default read-write config (omit
   `read_only=True`) and call `con.close()` when done with the peek cell.
 - Or restart the kernel to reset all connections.
-- In library code, call `backend.close()` (0.5.0 drops its reference to the
+- In library code, call `backend.close()` (0.5.1 drops its reference to the
   connection so the next `duckdb.connect(...)` can use any config).
 
 **My operations-log CSV has an unexpected `level` column**
-New in 0.5.0 — second column is now `level` (`INFO`/`WARN`/`ERROR`/`DEBUG`).
+New in 0.5.1 — second column is now `level` (`INFO`/`WARN`/`ERROR`/`DEBUG`).
 Read the CSV with `pandas.read_csv` and address columns by name rather than
 position.
 
 **I restarted after a crash and most filings are being skipped — is that right?**
-Yes. As of 0.5.0, `get_filings` defaults to `resume=True`. On a re-run, any
+Yes. As of 0.5.1, `get_filings` defaults to `resume=True`. On a re-run, any
 filing whose accession is already in your storage backend is skipped (no
 HTTP call, no parse). Check the operations log for
 `DOWNLOAD_SKIPPED_KNOWN` entries. If you deliberately want a full
@@ -518,13 +519,13 @@ re-fetch — for example, after upgrading and needing to pick up new
 parser columns — pass `resume=False`.
 
 **My filings all have empty `NAME_OF_ISSUER` / zero rows**
-Before 0.5.0, a single non-numeric cell in a 13F `<value>` or `<sshPrnamt>`
+Before 0.5.1, a single non-numeric cell in a 13F `<value>` or `<sshPrnamt>`
 element would silently wipe the entire holdings DataFrame for that filing.
 Fixed — bad cells become `<NA>` and a warning is logged; the rest of the
 filing is preserved.
 
 **Integration tests are failing in CI**
-They're opt-in as of 0.5.0 — triggered by the nightly schedule or manual
+They're opt-in as of 0.5.1 — triggered by the nightly schedule or manual
 `workflow_dispatch`. PRs don't hit live SEC.
 
 ---
