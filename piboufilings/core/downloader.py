@@ -825,9 +825,7 @@ class SECDownloader:
                 else quarters_to_fetch
             )
             for year, quarter in quarter_iter:
-                df = self._parse_form_idx(
-                    year, quarter, form_filters=form_filters, cik_filters=cik_filters
-                )
+                df = self._parse_form_idx(year, quarter, form_filters=form_filters, cik_filters=cik_filters)
                 if not df.empty:
                     all_reports.append(df)
 

@@ -40,6 +40,4 @@ SEC_READ_TIMEOUT = float(os.getenv("PIBOUFILINGS_SEC_READ_TIMEOUT", "15"))
 
 # Only log rate-limiter waits that are operationally meaningful to avoid noisy
 # per-request logs during normal throttling.
-RATE_LIMIT_LOG_THRESHOLD_SECONDS = float(
-    os.getenv("PIBOUFILINGS_RATE_LIMIT_LOG_THRESHOLD_SECONDS", "2")
-)
+RATE_LIMIT_LOG_THRESHOLD_SECONDS = float(os.getenv("PIBOUFILINGS_RATE_LIMIT_LOG_THRESHOLD_SECONDS", "2"))

@@ -186,9 +186,7 @@ def test_get_filings_form_type_none_expands_to_all(stubbed_download, tmp_path):
     assert (ops["operation_type"] == "FORM_TYPE_DEFAULTED_ALL").sum() == 1
     assert (ops["operation_type"] == "INPUT_VALIDATION_ERROR").sum() == 0
 
-    msgs = ops.loc[
-        ops["operation_type"] == "FORM_TYPE_PROCESSING_START", "download_error_message"
-    ].tolist()
+    msgs = ops.loc[ops["operation_type"] == "FORM_TYPE_PROCESSING_START", "download_error_message"].tolist()
     haystack = " ".join(msgs)
     for form in piboufilings.ALL_PARSEABLE_FORMS:
         assert form in haystack, f"expected {form} to be processed; got: {haystack}"

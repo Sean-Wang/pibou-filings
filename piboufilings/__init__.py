@@ -510,9 +510,7 @@ def get_filings(
             operation_type="FORM_TYPE_DEFAULTED_ALL",
             download_success=True,
             level="INFO",
-            download_error_message=(
-                f"form_type=None; expanding to all parseable forms: {form_type_list}"
-            ),
+            download_error_message=(f"form_type=None; expanding to all parseable forms: {form_type_list}"),
         )
     elif isinstance(form_type, str):
         form_type_list = [form_type]
