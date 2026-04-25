@@ -26,6 +26,7 @@ package_version = __version__
 
 SECTION16_ALIAS = "SECTION-6"
 SECTION16_BASE_FORMS = ("3", "4", "5")
+ALL_PARSEABLE_FORMS: List[str] = ["13F-HR", "NPORT-P", SECTION16_ALIAS]
 
 
 def _normalize_form_type(form_type: str) -> str:
@@ -65,6 +66,7 @@ def _cleanup_raw_files_for_cik(
     cik: str,
     form_type: str,
     logger: FilingLogger,
+    raw_root: Optional[Path] = None,
 ) -> None:
     """Delete the raw-filing files we just parsed, plus any now-empty parent
     directories. Called when ``keep_raw_files=False``.
@@ -117,43 +119,46 @@ def _cleanup_raw_files_for_cik(
         ),
     )
 
-    # Try to remove now-empty parent directories. We derive the candidate
-    # directories from the first raw path; layout depends on whether the form
-    # is an amendment (/A) and whether it is 13F (identifier dir).
+    # Walk up from each deleted file's parent and remove empty dirs until we
+    # hit a non-empty dir or the raw root. This handles all on-disk layouts
+    # (3-, 4-, and 5-level) without duplicating layout knowledge from
+    # ``_save_raw_filing``.
     if valid_raw_paths.empty:
         return
 
-    first_raw = Path(valid_raw_paths.iloc[0])
-    actual_file_parent = first_raw.parent
-    form_dir = actual_file_parent.parent if form_type.endswith("/A") else actual_file_parent
-    primary_id_dir = form_dir.parent
-
-    candidates: List[Path] = []
-    if form_type.endswith("/A"):
-        candidates.append(actual_file_parent)
-    candidates.extend([form_dir, primary_id_dir])
-
-    for dir_path in candidates:
-        if not dir_path.exists():
-            continue
-        try:
-            if not os.listdir(dir_path):
-                os.rmdir(dir_path)
+    root_resolved = Path(raw_root).resolve() if raw_root is not None else None
+    seen: set = set()
+    for raw_path_str in valid_raw_paths:
+        cur = Path(raw_path_str).parent.resolve()
+        while cur not in seen:
+            seen.add(cur)
+            if root_resolved is not None and (cur == root_resolved or root_resolved not in cur.parents):
+                break
+            if not cur.exists():
+                cur = cur.parent
+                continue
+            try:
+                if os.listdir(cur):
+                    break
+                os.rmdir(cur)
                 logger.log_operation(
                     cik=cik,
                     form_type_processed=form_type,
                     operation_type="DIR_DELETION_SUCCESS",
-                    download_error_message=f"Successfully deleted empty directory: {dir_path}",
+                    download_success=True,
+                    download_error_message=f"Successfully deleted empty directory: {cur}",
                 )
-        except OSError as e_rm_dir:
-            logger.log_operation(
-                cik=cik,
-                form_type_processed=form_type,
-                operation_type="DIR_DELETION_ERROR",
-                download_error_message=(
-                    f"Error deleting directory {dir_path} (not empty or other issue): {e_rm_dir}"
-                ),
-            )
+            except OSError as e_rm_dir:
+                logger.log_operation(
+                    cik=cik,
+                    form_type_processed=form_type,
+                    operation_type="DIR_DELETION_ERROR",
+                    download_error_message=(
+                        f"Error deleting directory {cur} (not empty or other issue): {e_rm_dir}"
+                    ),
+                )
+                break
+            cur = cur.parent
 
 
 def _build_raw_index(raw_root: Path) -> dict:
@@ -225,6 +230,7 @@ def process_filings_for_cik(
         cik=current_cik,  # Keep original CIK for backend logging if needed
         custom_identifier=identifier_for_log,  # Add the new identifier
         form_type_processed=form_type,
+        download_success=True,
         download_error_message=f"Starting processing for {identifier_for_log}, Form {form_type}. Downloaded count: {len(downloaded) if downloaded is not None else 0}",
     )
 
@@ -405,6 +411,7 @@ def process_filings_for_cik(
         cik=current_cik,  # Keep original CIK
         custom_identifier=identifier_for_log,
         form_type_processed=form_type,
+        download_success=True,
         download_error_message=f"Finished processing for {identifier_for_log}, Form {form_type}. Successful parses: {successful_parses}, Holdings: {total_holdings_extracted}",
     )
     return downloaded["raw_path"].tolist(), parsed_files, downloaded
@@ -414,7 +421,7 @@ def get_filings(
     user_name: str,
     user_agent_email: str,
     cik: Union[str, List[str], None] = None,
-    form_type: Union[str, List[str]] = "13F-HR",
+    form_type: Union[str, List[str], None] = "13F-HR",
     start_year: int = None,
     end_year: Optional[int] = None,
     base_dir: Optional[str] = None,
@@ -434,6 +441,7 @@ def get_filings(
         user_agent_email: Email address for SEC's fair access rules (required for User-Agent)
         cik: Company CIK number(s) - can be a single CIK string, a list of CIKs, or None to get all CIKs
         form_type: Type of form(s) to download (e.g., '13F-HR', ['13F-HR', 'NPORT-P']). Defaults to '13F-HR'.
+            Pass ``None`` to expand to all parseable forms (13F-HR, NPORT-P, SECTION-6).
         start_year: Starting year (defaults to current year)
         end_year: Ending year (defaults to current year)
         base_dir: Base directory for parsed data (defaults to './data_parsed')
@@ -490,24 +498,33 @@ def get_filings(
 
     logger.log_operation(
         operation_type="GET_FILINGS_START",
+        download_success=True,
         download_error_message=f"Starting get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}, Export: {export_format}",
     )
 
     # Determine the list of form types to process
     form_type_list: List[str]
-    if isinstance(form_type, str):
+    if form_type is None:
+        form_type_list = list(ALL_PARSEABLE_FORMS)
+        logger.log_operation(
+            operation_type="FORM_TYPE_DEFAULTED_ALL",
+            download_success=True,
+            level="INFO",
+            download_error_message=(f"form_type=None; expanding to all parseable forms: {form_type_list}"),
+        )
+    elif isinstance(form_type, str):
         form_type_list = [form_type]
     elif isinstance(form_type, list):
         form_type_list = form_type
     else:
-        # This case should ideally not be reached if a default is set and type hints are followed,
-        # but as a fallback or if None is explicitly passed after changes.
         logger.log_operation(
             operation_type="INPUT_VALIDATION_ERROR",
             cik=None,
             download_success=False,
             parse_success=False,
-            download_error_message="Invalid form_type provided; defaulting to '13F-HR'.",
+            download_error_message=(
+                f"Invalid form_type type {type(form_type).__name__}; defaulting to '13F-HR'."
+            ),
         )
         form_type_list = ["13F-HR"]
 
@@ -518,7 +535,11 @@ def get_filings(
         form_filters_for_index = [_normalize_form_type(ft) for ft in form_filters_for_index]
 
     full_index_data_for_years = downloader.get_sec_index_data(
-        start_year, end_year, form_filters=form_filters_for_index, cik_filters=cik_filters_for_index
+        start_year,
+        end_year,
+        form_filters=form_filters_for_index,
+        cik_filters=cik_filters_for_index,
+        show_progress=show_progress,
     )
 
     if full_index_data_for_years.empty:
@@ -731,6 +752,7 @@ def get_filings(
                         cik=current_cik_str,
                         form_type=current_form_str,
                         logger=logger,
+                        raw_root=raw_data_dir_path,
                     )
                     # If dir_path doesn't exist (e.g., already removed in a previous step), do nothing
 
@@ -754,6 +776,7 @@ def get_filings(
 
     logger.log_operation(
         operation_type="GET_FILINGS_END",
+        download_success=True,
         download_error_message=f"Finished get_filings. CIKs: {cik}, Forms: {form_type}, Years: {start_year}-{end_year}",
     )
 

@@ -59,8 +59,8 @@ class TokenBucketRateLimiter:
         """
         start_time = time.time()
 
-        with self.lock:
-            while True:
+        while True:
+            with self.lock:
                 self._refill()
 
                 if self.tokens >= tokens:
@@ -70,7 +70,10 @@ class TokenBucketRateLimiter:
                 if not block:
                     return False  # Not enough tokens and not blocking
 
-                # Blocking mode: calculate wait time and sleep
+                # Blocking mode: calculate wait time, then sleep *outside* the
+                # lock. Holding the lock while sleeping serializes every other
+                # worker behind the sleeping thread and can make concurrent
+                # downloads look stalled.
                 deficit = tokens - self.tokens  # Deficit should be > 0 here
 
                 if self.rate <= 0:  # Cannot acquire if rate is zero or negative
@@ -98,13 +101,13 @@ class TokenBucketRateLimiter:
                         required_wait_time, remaining_timeout
                     )  # Ensure we don't sleep past timeout
 
-                if sleep_duration > 0:  # Only sleep if there's a positive duration
-                    time.sleep(sleep_duration)
+            if sleep_duration > 0:  # Only sleep if there's a positive duration
+                time.sleep(sleep_duration)
 
-                # After sleep (or if no sleep was needed but still in loop due to timeout logic),
-                # the loop will continue, _refill, and check tokens again.
-                # If timeout occurred and we returned False, loop is exited.
-                # If timeout is None, loop continues until tokens are acquired.
+            # After sleep (or if no sleep was needed but still in loop due to
+            # timeout logic), the loop will continue, _refill, and check tokens
+            # again. If timeout occurred and we returned False, loop is exited.
+            # If timeout is None, loop continues until tokens are acquired.
 
 
 class GlobalRateLimiter:

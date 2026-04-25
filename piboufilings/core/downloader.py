@@ -25,10 +25,13 @@ from ..config.settings import (
     DATA_DIR,
     DEFAULT_HEADERS,
     MAX_RETRIES,
+    RATE_LIMIT_LOG_THRESHOLD_SECONDS,
     REQUEST_DELAY,
     RETRY_STATUS_CODES,
     SAFETY_FACTOR,
+    SEC_CONNECT_TIMEOUT,
     SEC_MAX_REQ_PER_SEC,
+    SEC_READ_TIMEOUT,
 )
 from .logger import FilingLogger
 from .rate_limiter import GlobalRateLimiter
@@ -525,16 +528,30 @@ class SECDownloader:
         # Keep unknown forms isolated by quarter by default.
         return "quarter"
 
-    def _respect_rate_limit(self):
+    def _respect_rate_limit(self) -> float:
         """Ensure requests comply with SEC rate limits using the global rate limiter."""
         # Use the global rate limiter to control request rate
+        start = time.perf_counter()
         self.rate_limiter.acquire(block=True)
+        return time.perf_counter() - start
 
     def _get(
-        self, url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 30
+        self,
+        url: str,
+        headers: Optional[Dict[str, str]] = None,
+        timeout: Union[int, float, Tuple[float, float]] = (SEC_CONNECT_TIMEOUT, SEC_READ_TIMEOUT),
     ) -> requests.Response:
         """Unified GET with rate limit and timeout."""
-        self._respect_rate_limit()
+        rate_wait_seconds = self._respect_rate_limit() or 0.0
+        if rate_wait_seconds >= RATE_LIMIT_LOG_THRESHOLD_SECONDS:
+            self.logger.log_operation(
+                operation_type="RATE_LIMIT_WAIT",
+                download_success=True,
+                level="INFO",
+                download_error_message=(
+                    f"Waited {rate_wait_seconds:.2f}s for SEC rate-limit token before GET {url}"
+                ),
+            )
         return self.session.get(url, headers=headers or self.headers, timeout=timeout)
 
     def _download_single_filing(
@@ -560,7 +577,29 @@ class SECDownloader:
                 f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{clean_accession}/{accession_number}.txt"
             )
 
+            request_started_at = time.perf_counter()
+            self.logger.log_operation(
+                cik=cik,
+                accession_number=accession_number,
+                operation_type="DOWNLOAD_SINGLE_FILING_REQUEST_START",
+                download_success=True,
+                level="INFO",
+                download_error_message=f"Starting GET {url}",
+            )
+
             response = self._get(url)
+            request_elapsed_seconds = time.perf_counter() - request_started_at
+            self.logger.log_operation(
+                cik=cik,
+                accession_number=accession_number,
+                operation_type="DOWNLOAD_SINGLE_FILING_REQUEST_END",
+                download_success=response.status_code == 200,
+                level="INFO" if response.status_code == 200 else "ERROR",
+                download_error_message=(
+                    f"Finished GET in {request_elapsed_seconds:.2f}s with HTTP {response.status_code}: {url}"
+                ),
+                error_code=response.status_code,
+            )
             # Log the request details regardless of success/failure
             # self.logger.log_operation( ... ) # Consider adding a generic request log here if needed
 
@@ -620,15 +659,21 @@ class SECDownloader:
                 "url": url,
             }
         except requests.RequestException as e:
+            request_elapsed_seconds = None
+            if "request_started_at" in locals():
+                request_elapsed_seconds = time.perf_counter() - request_started_at
             status_code = None
             if hasattr(e, "response") and e.response is not None:
                 status_code = e.response.status_code
+            elapsed_msg = (
+                f" after {request_elapsed_seconds:.2f}s" if request_elapsed_seconds is not None else ""
+            )
             self.logger.log_operation(
                 cik=cik,
                 accession_number=accession_number,
                 operation_type="DOWNLOAD_SINGLE_FILING_REQUEST_EXCEPTION",
                 download_success=False,
-                download_error_message=f"Request error: {str(e)}",
+                download_error_message=f"Request error{elapsed_msg}: {type(e).__name__}: {str(e)}; url={url}",
                 error_code=status_code,  # Log status_code if available from exception
             )
             return None
@@ -742,6 +787,7 @@ class SECDownloader:
         end_year: Optional[int] = None,
         form_filters: Optional[List[str]] = None,
         cik_filters: Optional[List[str]] = None,
+        show_progress: bool = False,
     ) -> pd.DataFrame:
         """
         Get SEC EDGAR index data for the specified year range.
@@ -759,20 +805,29 @@ class SECDownloader:
 
             form_filters, cik_filters = normalize_filters(form_filters, cik_filters)
 
-            all_reports = []
-            for year in range(start_year, end_year + 1):
-                for quarter in range(1, 5):
-                    # Skip future quarters
-                    current_year = datetime.today().year
-                    current_quarter = (datetime.today().month - 1) // 3 + 1
-                    if year > current_year or (year == current_year and quarter > current_quarter):
-                        continue
+            current_year = datetime.today().year
+            current_quarter = (datetime.today().month - 1) // 3 + 1
+            quarters_to_fetch = [
+                (year, quarter)
+                for year in range(start_year, end_year + 1)
+                for quarter in range(1, 5)
+                if not (year > current_year or (year == current_year and quarter > current_quarter))
+            ]
 
-                    df = self._parse_form_idx(
-                        year, quarter, form_filters=form_filters, cik_filters=cik_filters
-                    )
-                    if not df.empty:
-                        all_reports.append(df)
+            all_reports = []
+            quarter_iter = (
+                tqdm(
+                    quarters_to_fetch,
+                    desc=f"Fetching SEC index {start_year}-{end_year}",
+                    unit="qtr",
+                )
+                if show_progress and end_year > start_year
+                else quarters_to_fetch
+            )
+            for year, quarter in quarter_iter:
+                df = self._parse_form_idx(year, quarter, form_filters=form_filters, cik_filters=cik_filters)
+                if not df.empty:
+                    all_reports.append(df)
 
             if not all_reports:
                 self.logger.log_operation(
