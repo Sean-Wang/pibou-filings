@@ -32,10 +32,9 @@ def test_cleanup_removes_raw_files_and_empty_parents(tmp_path):
 
 
 def test_cleanup_13f_nested_accession_layout_leaves_identifier_dir(tmp_path):
-    """Known limitation: when ``_save_raw_filing`` used the
-    ``FORM_13F_FILE_NUMBER`` path (accession subdir), the cleanup helper only
-    walks three levels and does NOT remove the outermost identifier dir. This
-    test locks in current behavior; fixing it is tracked as a follow-up.
+    """When ``_save_raw_filing`` uses the ``FORM_13F_FILE_NUMBER`` path
+    (accession subdir), cleanup removes the raw file and all now-empty parent
+    directories up to the raw root.
     """
     identifier_dir = tmp_path / "data" / "028_12345"
     form_dir = identifier_dir / "13F-HR"
@@ -54,8 +53,8 @@ def test_cleanup_13f_nested_accession_layout_leaves_identifier_dir(tmp_path):
     assert not accession_dir.exists()
     # form_dir is also now empty → removed.
     assert not form_dir.exists()
-    # identifier_dir is left behind (known limitation of the 3-level walk).
-    assert identifier_dir.exists()
+    # identifier_dir is also now empty → removed.
+    assert not identifier_dir.exists()
 
 
 def test_cleanup_does_nothing_for_empty_df(tmp_path):
