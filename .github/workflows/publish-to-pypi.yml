@@ -38,6 +38,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install build twine
 
+      - name: Verify release tag matches package version
+        if: github.event_name == 'release'
+        run: |
+          package_version="$(python - <<'PY'
+          from piboufilings._version import __version__
+
+          print(__version__)
+          PY
+          )"
+          release_tag="${GITHUB_REF_NAME#v}"
+          if [ "$package_version" != "$release_tag" ]; then
+            echo "Package version ($package_version) does not match release tag (${GITHUB_REF_NAME})." >&2
+            echo "Create a release tag that matches piboufilings._version.__version__, e.g. v$package_version." >&2
+            exit 1
+          fi
+
       - name: Build the package
         run: python -m build
 

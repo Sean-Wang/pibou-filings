@@ -6,6 +6,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-04-25
+
 ### Added
 - **Resume / crash recovery** for `get_filings`. New `resume: bool = True`
   parameter. On a re-run, the orchestrator:
