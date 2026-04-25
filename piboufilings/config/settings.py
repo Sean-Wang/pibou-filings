@@ -29,3 +29,17 @@ DEFAULT_HEADERS = {
 MAX_RETRIES = 5
 BACKOFF_FACTOR = 1
 RETRY_STATUS_CODES = [429, 500, 502, 503, 504]
+
+# Timeout / diagnostics settings
+# ``requests`` accepts a ``(connect_timeout, read_timeout)`` tuple. Keeping the
+# read timeout lower than the previous scalar 30s prevents one pathological SEC
+# response from tying up a worker for a long time, especially when urllib3
+# retries are also enabled.
+SEC_CONNECT_TIMEOUT = float(os.getenv("PIBOUFILINGS_SEC_CONNECT_TIMEOUT", "5"))
+SEC_READ_TIMEOUT = float(os.getenv("PIBOUFILINGS_SEC_READ_TIMEOUT", "15"))
+
+# Only log rate-limiter waits that are operationally meaningful to avoid noisy
+# per-request logs during normal throttling.
+RATE_LIMIT_LOG_THRESHOLD_SECONDS = float(
+    os.getenv("PIBOUFILINGS_RATE_LIMIT_LOG_THRESHOLD_SECONDS", "2")
+)

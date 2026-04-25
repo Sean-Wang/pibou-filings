@@ -159,6 +159,64 @@ def test_get_filings_writes_duckdb_output(stubbed_download, tmp_path):
         con.close()
 
 
+def _read_log_ops(log_dir):
+    log_files = list(log_dir.glob("filing_operations_*.csv"))
+    assert log_files, f"no log file found in {log_dir}"
+    return pd.read_csv(log_files[0])
+
+
+def test_get_filings_form_type_none_expands_to_all(stubbed_download, tmp_path):
+    log_dir = tmp_path / "logs"
+    piboufilings.get_filings(
+        user_name="Reviewer",
+        user_agent_email="reviewer@example.com",
+        cik="0001067983",
+        form_type=None,
+        start_year=2023,
+        end_year=2023,
+        base_dir=str(tmp_path / "parsed"),
+        log_dir=str(log_dir),
+        raw_data_dir=str(tmp_path / "raw_root"),
+        show_progress=False,
+        max_workers=1,
+        export_format="csv",
+    )
+
+    ops = _read_log_ops(log_dir)
+    assert (ops["operation_type"] == "FORM_TYPE_DEFAULTED_ALL").sum() == 1
+    assert (ops["operation_type"] == "INPUT_VALIDATION_ERROR").sum() == 0
+
+    msgs = ops.loc[
+        ops["operation_type"] == "FORM_TYPE_PROCESSING_START", "download_error_message"
+    ].tolist()
+    haystack = " ".join(msgs)
+    for form in piboufilings.ALL_PARSEABLE_FORMS:
+        assert form in haystack, f"expected {form} to be processed; got: {haystack}"
+
+
+def test_get_filings_invalid_form_type_still_logs_error(stubbed_download, tmp_path):
+    log_dir = tmp_path / "logs"
+    piboufilings.get_filings(
+        user_name="Reviewer",
+        user_agent_email="reviewer@example.com",
+        cik="0001067983",
+        form_type=42,  # type: ignore[arg-type]
+        start_year=2023,
+        end_year=2023,
+        base_dir=str(tmp_path / "parsed"),
+        log_dir=str(log_dir),
+        raw_data_dir=str(tmp_path / "raw_root"),
+        show_progress=False,
+        max_workers=1,
+        export_format="csv",
+    )
+
+    ops = _read_log_ops(log_dir)
+    err_rows = ops[ops["operation_type"] == "INPUT_VALIDATION_ERROR"]
+    assert len(err_rows) == 1
+    assert "int" in str(err_rows.iloc[0]["download_error_message"])
+
+
 def test_get_filings_unknown_export_format_raises(tmp_path):
     with pytest.raises(ValueError, match="Unknown export_format"):
         piboufilings.get_filings(
